@@ -1,6 +1,6 @@
 [package]
 name = "tiny-station"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
 description = "Logical mesh proxy network: any tiny-station node can relay requests through the whole mesh."
 
@@ -26,3 +26,5 @@ x25519-dalek = { version = "2", features = ["static_secrets"] }
 mlua = { version = "0.12.2", features = ["luau", "serialize"] }
 hmac = "0.12"
 ed25519-dalek = "2"
+rust-embed = "8.13.0"
+mime_guess = "2.0.5"

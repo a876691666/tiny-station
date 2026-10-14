@@ -2,7 +2,6 @@ mod api;
 mod atomic;
 mod config;
 mod crypto;
-mod dashboard;
 mod identity;
 mod kernel;
 mod keys;
@@ -12,6 +11,7 @@ mod proxy;
 mod replay;
 mod route;
 mod state;
+mod web;
 mod wire;
 
 use anyhow::{bail, Context, Result};

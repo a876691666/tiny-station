@@ -11,6 +11,7 @@ target
 *.kernel.prev.lua
 
 dist
+node_modules
 
 tiny-station.toml
 /tiny-station-*

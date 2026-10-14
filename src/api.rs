@@ -1,6 +1,5 @@
 use crate::config::Config;
 use crate::crypto;
-use crate::dashboard;
 use crate::net;
 use crate::protocol::{
     Capability, GossipBody, Hello, HelloAck, KeyRotate, NodeInfo, NodeStatus, Ping, ReachAnswer,
@@ -17,7 +16,7 @@ use std::time::Duration;
 use axum::body::{Body, Bytes};
 use axum::extract::{DefaultBodyLimit, Path, Query, RawQuery, State};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode};
-use axum::response::{Html, IntoResponse, Response};
+use axum::response::{IntoResponse, Response};
 use axum::routing::{any, get, post};
 use axum::{Json, Router};
 use base64::{engine::general_purpose::STANDARD, Engine};
@@ -30,7 +29,6 @@ pub type Shared = Arc<AppState>;
 
 pub fn router(state: Shared) -> Router {
     Router::new()
-        .route("/", get(dashboard_handler))
         .route("/api/handshake", post(api_handshake))
         .route("/api/peers", post(api_peers))
         .route("/api/gossip", post(api_gossip))
@@ -53,6 +51,7 @@ pub fn router(state: Shared) -> Router {
         .route("/api/kernel/sync", post(api_kernel_sync))
         .route("/x/*path", any(kernel_endpoint))
         .route("/proxy", any(proxy_handler))
+        .fallback(spa_handler)
         .layer(DefaultBodyLimit::max(256 * 1024 * 1024))
         .with_state(state)
 }
@@ -988,13 +987,19 @@ async fn api_put_config(
     Json(serde_json::json!({"ok": true, "saved_to": s.config_path})).into_response()
 }
 
-async fn dashboard_handler(State(s): State<Shared>, headers: HeaderMap) -> Response {
+/// Fallback for anything not matched by an API route: serve the embedded SPA
+/// (client-side routing). Requires admin auth, which also triggers the
+/// browser's Basic-auth prompt on first load.
+async fn spa_handler(State(s): State<Shared>, headers: HeaderMap, uri: axum::http::Uri) -> Response {
     if !admin_ok(&headers, &s).await {
         return challenge();
     }
-    let status = build_status(&s).await;
-    let cfg = s.config().await;
-    Html(dashboard::render(&status, &cfg)).into_response()
+    let path = uri.path();
+    // Unknown API/x paths should 404, not return the HTML shell.
+    if path.starts_with("/api/") || path.starts_with("/x/") {
+        return plain(StatusCode::NOT_FOUND, "not found");
+    }
+    crate::web::serve(path)
 }
 
 // ------------------------- data plane -------------------------

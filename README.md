@@ -216,6 +216,27 @@ curl -u mesh:123456 -X POST \
 
   产物命名如 `tiny-station-linux-x86_64.tar.gz`、`tiny-station-windows-x86_64.zip`。
 
+## 管理界面(前端)
+
+管理界面是一个独立的 Vue 单页应用,源码在 `web/`,构建产物在编译期被**嵌入二进制**
+(`rust-embed`),因此发布仍是单文件。
+
+- 技术栈:**Vue 3 + Vite + TypeScript + Vue Router + Naive UI**。
+- **按业务拆分页面**(路由级懒加载,每页单独打包):总览 / 节点 / 组网配置 / 代理测试 / 内核。
+- **Naive UI 按需引入**(逐组件 `import`),由 Rollup 自动**树摇**;无需全局样式表。
+- 鉴权沿用 HTTP Basic:首次加载页面时浏览器弹窗,后续同源请求自动复用。
+
+```sh
+# 开发(热更新,自动把 /api、/proxy、/x 代理到本机节点)
+cd web && pnpm install && pnpm dev
+
+# 构建产物,再编译进二进制
+cd web && pnpm build && cd .. && cargo build --release
+```
+
+> 未构建前端时,`cargo build` 会嵌入一个占位页提示先执行 `pnpm build`(`build.rs` 保证
+> `web/dist` 存在)。CI/发布流程会自动先构建前端再编译 Rust。
+
 ---
 
 ## 端口与安全
