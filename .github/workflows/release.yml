@@ -1,0 +1,117 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x86_64
+            os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            bin: tiny-station
+            archive: tar.gz
+            cross: true
+          - name: linux-aarch64
+            os: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            bin: tiny-station
+            archive: tar.gz
+            cross: true
+          - name: macos-x86_64
+            os: macos-latest
+            target: x86_64-apple-darwin
+            bin: tiny-station
+            archive: tar.gz
+            cross: false
+          - name: macos-arm64
+            os: macos-latest
+            target: aarch64-apple-darwin
+            bin: tiny-station
+            archive: tar.gz
+            cross: false
+          - name: windows-x86_64
+            os: windows-latest
+            target: x86_64-pc-windows-msvc
+            bin: tiny-station.exe
+            archive: zip
+            cross: false
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Install cross
+        if: matrix.cross
+        uses: taiki-e/install-action@cross
+
+      - name: Build (cross)
+        if: matrix.cross
+        run: cross build --release --locked --target ${{ matrix.target }}
+
+      - name: Build (cargo)
+        if: ${{ !matrix.cross }}
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Package
+        shell: bash
+        run: |
+          set -euo pipefail
+          pkg="tiny-station-${{ matrix.name }}"
+          mkdir -p "$pkg"
+          cp "target/${{ matrix.target }}/release/${{ matrix.bin }}" "$pkg/"
+          [ -f config.example.toml ] && cp config.example.toml "$pkg/" || true
+          if [ "${{ matrix.archive }}" = "zip" ]; then
+            7z a "$pkg.zip" "$pkg" >/dev/null
+          else
+            tar -czf "$pkg.tar.gz" "$pkg"
+          fi
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.name }}
+          path: tiny-station-${{ matrix.name }}.*
+          if-no-files-found: error
+
+  release:
+    name: Publish release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
+          fail_on_unmatched_files: true
