@@ -1,0 +1,32 @@
+# tiny-station on Docker.
+#
+# `network_mode: host` 是本节点的正确形态(且必需):
+#   - 节点必须在「宿主机真实 IP:端口」上被全网其它节点直连;
+#   - 节点会广播自身 IP(bridge 下会拿到容器内网 IP,错误);
+#   - 节点会扫描宿主机 127.0.0.1 的本地出口代理(Clash/v2ray)与 reachable 服务。
+# 因此 host 网络下**不要**写端口映射(`ports` 会被忽略)。
+#
+# 用法:
+#   docker compose up -d --build      # 构建镜像并后台启动
+#   docker compose logs -f            # 看日志
+#   docker compose down               # 停止(数据保留在 ./data)
+#
+# 首次启动会在 ./data/tiny-station.toml 生成配置(含随机 mesh_key),
+# 把它复制到其它节点的配置里即可组网。
+
+services:
+  tiny-station:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: tiny-station:latest
+    container_name: tiny-station
+    network_mode: host
+    restart: unless-stopped
+    volumes:
+      # 配置 / 身份 / cluster key / 内核持久化(切勿换成匿名卷,否则节点身份会丢)
+      - ./data:/data
+    environment:
+      RUST_LOG: tiny_station=info
+    # 非特权端口(45910+)无需任何 capability;仅当要绑 <1024 端口时才需要:
+    # cap_add: [NET_BIND_SERVICE]

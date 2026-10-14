@@ -12,6 +12,7 @@ target
 
 dist
 node_modules
+/data
 
 tiny-station.toml
-/tiny-station-*
+/tiny-station-*/bin

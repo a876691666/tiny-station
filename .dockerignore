@@ -1,0 +1,16 @@
+.git
+.gitignore
+target
+data
+*.log
+
+# 前端依赖与产物在镜像内构建,无需进入上下文
+web/node_modules
+web/dist
+
+# 本机运行时文件
+tiny-station.toml
+.*.kernel
+.*.identity
+.*.clusterkey
+.*.nodeid

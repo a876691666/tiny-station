@@ -239,6 +239,34 @@ cd web && pnpm build && cd .. && cargo build --release
 
 ---
 
+## Docker
+
+节点需要被全网拨号,并对齐宿主机网络,因此 **必须用 host 网络**(Linux 宿主;macOS/Windows
+的 Docker Desktop 不支持真正的 host 网络,请直接跑二进制)。
+
+```sh
+# 本地从源码构建并后台启动(host 网络 + 数据卷)
+docker compose up -d --build
+docker compose logs -f
+```
+
+发布流程(tag `v*`)会自动构建并推送**多架构镜像到 GHCR**:
+
+```sh
+docker run -d --name tiny-station \
+  --network host \
+  -v /opt/tiny-station:/data \
+  ghcr.io/a876691666/tiny-station:latest
+```
+
+- `network_mode: host` 下**不要**写端口映射(`ports` 被忽略);数据(配置/身份/密钥/内核)务必
+  挂卷到 `/data`,否则节点身份会丢。
+- 非特权端口无需任何 capability。
+- 两个 Dockerfile:`Dockerfile`(本地/`compose`,从源码多阶段构建)与 `Dockerfile.release`
+  (CI,复用已发布的 Linux 二进制,免重复编译)。
+
+---
+
 ## 端口与安全
 
 - 默认端口 `45910`–`45914`,首次运行后固定一个;节点间互通需在防火墙 / 安全组放行该端口(或整个范围)。

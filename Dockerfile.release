@@ -1,0 +1,19 @@
+# syntax=docker/dockerfile:1
+#
+# CI 用:从**已发布的 Linux 二进制**打包运行镜像(复用 release 产物,不重复编译)。
+# 本地从源码构建请用 `Dockerfile` / `docker compose build`。
+#
+# 每个架构的二进制放在 bin/<TARGETARCH>/tiny-station(TARGETARCH 由 buildx 注入,
+# 取值 amd64 / arm64)。二进制内已嵌入管理界面。
+
+FROM debian:bookworm-slim
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends ca-certificates \
+ && rm -rf /var/lib/apt/lists/*
+
+ARG TARGETARCH
+COPY bin/${TARGETARCH}/tiny-station /usr/local/bin/tiny-station
+
+WORKDIR /data
+ENV RUST_LOG=tiny_station=info
+ENTRYPOINT ["tiny-station", "-c", "/data/tiny-station.toml"]
