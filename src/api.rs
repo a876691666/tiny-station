@@ -14,7 +14,8 @@ use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{any, get, post};
 use axum::{Json, Router};
 use base64::{engine::general_purpose::STANDARD, Engine};
-use std::collections::{HashMap, HashSet};
+use serde::{Deserialize, Serialize};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
 pub type Shared = Arc<AppState>;
@@ -28,6 +29,7 @@ pub fn router(state: Shared) -> Router {
         .route("/api/status", get(api_status))
         .route("/api/config", get(api_get_config).post(api_put_config))
         .route("/api/tunnel", post(api_tunnel))
+        .route("/api/request", post(api_request))
         .route("/api/reach", get(api_reach))
         .route("/proxy", any(proxy_handler))
         .layer(DefaultBodyLimit::max(256 * 1024 * 1024))
@@ -127,6 +129,182 @@ async fn api_tunnel(
     Json(route::route_request(&s, req).await).into_response()
 }
 
+// ------------------------- public data plane -------------------------
+
+/// Standardized request envelope for external services (`POST /api/request`).
+///
+/// Unlike `/proxy`, every parameter travels in the JSON body — never in the
+/// query string — so target URLs, headers and metadata are not length limited.
+#[derive(Debug, Deserialize)]
+pub struct RequestEnvelope {
+    /// Absolute target URL, e.g. `https://api.example.com/v1/items?page=2`.
+    pub url: String,
+    /// HTTP method. Defaults to `GET`.
+    #[serde(default)]
+    pub method: Option<String>,
+    /// Headers forwarded to the target. An `authorization` entry here goes to
+    /// the *target*, independently of the Basic auth used to reach this node.
+    #[serde(default)]
+    pub headers: BTreeMap<String, String>,
+    /// Request body. A JSON string is sent verbatim (`body_encoding=utf8`) or
+    /// base64-decoded (`body_encoding=base64`); any other JSON value is
+    /// serialized to JSON.
+    #[serde(default)]
+    pub body: Option<serde_json::Value>,
+    /// `utf8` (default) | `base64`.
+    #[serde(default)]
+    pub body_encoding: Option<String>,
+    /// Where to route the request: `auto` (default) | node name | node id |
+    /// egress proxy name | `self`.
+    #[serde(default)]
+    pub via: Option<String>,
+    /// Force a specific egress proxy name on the executing node.
+    #[serde(default)]
+    pub egress: Option<String>,
+    /// Upstream timeout in milliseconds (default 90000).
+    #[serde(default)]
+    pub timeout_ms: Option<u64>,
+    /// `json` (default) returns the envelope below; `raw` returns the upstream
+    /// status/headers/body unchanged.
+    #[serde(default)]
+    pub mode: Option<String>,
+}
+
+/// Standardized response envelope for `POST /api/request` (unless `mode=raw`).
+#[derive(Debug, Serialize)]
+pub struct ResponseEnvelope {
+    /// `true` when the mesh executed the request (any upstream status);
+    /// `false` on a routing/transport error, see `error`.
+    pub ok: bool,
+    pub status: u16,
+    /// Response headers, lower-cased (duplicate values collapse to the last).
+    pub headers: BTreeMap<String, String>,
+    /// All `Set-Cookie` values, duplicates preserved.
+    pub cookies: Vec<String>,
+    /// Response body, base64-encoded.
+    pub body: String,
+    pub body_encoding: &'static str,
+    /// Id of the node that actually executed the request.
+    pub served_by: String,
+    /// Node ids the request traversed, from the entry node to `served_by`.
+    pub path: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub egress: Option<String>,
+    pub elapsed_ms: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+impl From<TunnelResponse> for ResponseEnvelope {
+    fn from(r: TunnelResponse) -> Self {
+        let mut headers = BTreeMap::new();
+        let mut cookies = Vec::new();
+        let mut egress = None;
+        for (k, v) in &r.headers {
+            let lower = k.to_ascii_lowercase();
+            if lower == "set-cookie" {
+                cookies.push(v.clone());
+            } else if lower == "x-tiny-station-egress" {
+                egress = Some(v.clone());
+            } else {
+                headers.insert(lower, v.clone());
+            }
+        }
+        ResponseEnvelope {
+            ok: r.error.is_none(),
+            status: r.status,
+            headers,
+            cookies,
+            body: r.body_b64,
+            body_encoding: "base64",
+            served_by: r.served_by,
+            path: r.path,
+            egress,
+            elapsed_ms: r.elapsed_ms,
+            error: r.error,
+        }
+    }
+}
+
+/// Decode the request body according to `body_encoding`.
+fn encode_body(
+    body: Option<&serde_json::Value>,
+    encoding: Option<&str>,
+) -> Result<Vec<u8>, String> {
+    let Some(v) = body else {
+        return Ok(Vec::new());
+    };
+    match encoding.unwrap_or("utf8") {
+        "base64" => {
+            let s = v.as_str().ok_or_else(|| {
+                "body must be a JSON string when body_encoding=base64".to_string()
+            })?;
+            STANDARD
+                .decode(s.trim())
+                .map_err(|e| format!("invalid base64 body: {}", e))
+        }
+        "utf8" | "text" | "plain" | "" => match v {
+            serde_json::Value::String(s) => Ok(s.as_bytes().to_vec()),
+            other => serde_json::to_vec(other).map_err(|e| e.to_string()),
+        },
+        other => Err(format!("unknown body_encoding '{}'", other)),
+    }
+}
+
+/// `POST /api/request` — the standardized data-plane API.
+///
+/// Authenticate with the mesh credential via HTTP Basic auth, send a JSON
+/// [`RequestEnvelope`] as the body. The node resolves the target through the
+/// mesh and returns a JSON [`ResponseEnvelope`] (or the raw response when
+/// `mode` is `raw`).
+async fn api_request(
+    State(s): State<Shared>,
+    headers: HeaderMap,
+    Json(req): Json<RequestEnvelope>,
+) -> Response {
+    if !mesh_ok(&headers, &s).await {
+        return challenge();
+    }
+    let body = match encode_body(req.body.as_ref(), req.body_encoding.as_deref()) {
+        Ok(b) => b,
+        Err(e) => return plain(StatusCode::BAD_REQUEST, &e),
+    };
+    let method = req
+        .method
+        .as_deref()
+        .map(|m| m.trim().to_ascii_uppercase())
+        .filter(|m| !m.is_empty())
+        .unwrap_or_else(|| "GET".to_string());
+    let (dest, resolved_egress) = route::resolve(&s, &req.url, req.via.as_deref()).await;
+    let egress = req.egress.or(resolved_egress);
+    let mut target_headers = req.headers;
+    // A structured JSON body (object / array / number ...) is serialized to
+    // JSON; advertise that unless the caller already set a content-type.
+    if matches!(req.body.as_ref(), Some(v) if !v.is_string())
+        && !target_headers
+            .keys()
+            .any(|k| k.eq_ignore_ascii_case("content-type"))
+    {
+        target_headers.insert("content-type".to_string(), "application/json".to_string());
+    }
+    let tr = TunnelRequest {
+        dest,
+        method,
+        url: req.url,
+        headers: target_headers.into_iter().collect(),
+        body_b64: STANDARD.encode(&body),
+        egress,
+        hops: vec![],
+        timeout_ms: req.timeout_ms,
+    };
+    let resp = route::route_request(&s, tr).await;
+    if req.mode.as_deref() == Some("raw") {
+        tunnel_to_response(resp)
+    } else {
+        Json(ResponseEnvelope::from(resp)).into_response()
+    }
+}
+
 /// Liveness probe used by peers to discover who can reach a given target.
 /// `GET /api/reach?host=127.0.0.1&port=39181` ->
 /// `{"reachable":true,"egress":null}` (direct) or `"egress":"clash"`.
@@ -203,15 +381,30 @@ async fn proxy_handler(
     if !admin_ok(&headers, &s).await {
         return challenge();
     }
-    let Some(target) = q.get("target").cloned() else {
-        return plain(StatusCode::BAD_REQUEST, "missing ?target=<url>");
+    let target = q
+        .get("target")
+        .cloned()
+        .or_else(|| header_str(&headers, "x-tiny-station-target"));
+    let Some(target) = target else {
+        return plain(
+            StatusCode::BAD_REQUEST,
+            "missing ?target=<url> or X-Tiny-Station-Target header",
+        );
     };
-    let via = q.get("via").map(String::as_str).unwrap_or("auto");
-    let (dest, egress) = route::resolve(&s, &target, Some(via)).await;
+    let via = q
+        .get("via")
+        .cloned()
+        .or_else(|| header_str(&headers, "x-tiny-station-via"))
+        .unwrap_or_else(|| "auto".to_string());
+    let (dest, egress) = route::resolve(&s, &target, Some(&via)).await;
 
     let mut hdrs = Vec::new();
     for (k, v) in headers.iter() {
-        if k == "authorization" || k == "host" {
+        if k == "authorization"
+            || k == "host"
+            || k == "x-tiny-station-target"
+            || k == "x-tiny-station-via"
+        {
             continue;
         }
         if let Ok(vs) = v.to_str() {
@@ -227,8 +420,16 @@ async fn proxy_handler(
         body_b64: STANDARD.encode(&body),
         egress,
         hops: vec![],
+        timeout_ms: None,
     };
     tunnel_to_response(route::route_request(&s, req).await)
+}
+
+fn header_str(headers: &HeaderMap, name: &str) -> Option<String> {
+    headers
+        .get(name)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string)
 }
 
 fn plain(status: StatusCode, msg: &str) -> Response {
@@ -432,5 +633,44 @@ pub async fn build_status(state: &AppState) -> StatusResponse {
         routes,
         capabilities,
         egress,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn body_utf8_string() {
+        let v = json!("hello");
+        assert_eq!(encode_body(Some(&v), None).unwrap(), b"hello".to_vec());
+    }
+
+    #[test]
+    fn body_json_object_is_serialized() {
+        let v = json!({"a": 1});
+        let out = encode_body(Some(&v), Some("utf8")).unwrap();
+        assert_eq!(out, br#"{"a":1}"#.to_vec());
+    }
+
+    #[test]
+    fn body_base64_decoded() {
+        let v = json!("aGVsbG8=");
+        assert_eq!(
+            encode_body(Some(&v), Some("base64")).unwrap(),
+            b"hello".to_vec()
+        );
+    }
+
+    #[test]
+    fn body_base64_requires_string() {
+        let v = json!({"a": 1});
+        assert!(encode_body(Some(&v), Some("base64")).is_err());
+    }
+
+    #[test]
+    fn body_absent_is_empty() {
+        assert!(encode_body(None, None).unwrap().is_empty());
     }
 }

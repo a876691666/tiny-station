@@ -111,7 +111,12 @@ async fn main() -> Result<()> {
     );
     tracing::info!("管理界面: http://{}:{}/", ip, listen_port);
     tracing::info!(
-        "代理接口: http://{}:{}/proxy?target=<url>&via=auto",
+        "标准请求接口(JSON): POST http://{}:{}/api/request",
+        ip,
+        listen_port
+    );
+    tracing::info!(
+        "兼容代理接口: http://{}:{}/proxy?target=<url>&via=auto",
         ip,
         listen_port
     );

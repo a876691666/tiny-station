@@ -68,6 +68,10 @@ pub struct TunnelRequest {
     /// Nodes already visited, used to detect loops.
     #[serde(default)]
     pub hops: Vec<String>,
+    /// Optional upstream timeout in milliseconds. Forwarded unchanged across
+    /// hops; only the executing node applies it to the outbound request.
+    #[serde(default)]
+    pub timeout_ms: Option<u64>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

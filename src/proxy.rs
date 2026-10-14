@@ -31,12 +31,20 @@ fn proxy_scheme(port: u16) -> &'static str {
     }
 }
 
-async fn build_client(state: &AppState, egress: Option<&str>) -> Result<reqwest::Client, String> {
+async fn build_client(
+    state: &AppState,
+    egress: Option<&str>,
+    timeout_ms: Option<u64>,
+) -> Result<reqwest::Client, String> {
     // `.no_proxy()` disables any ambient HTTP_PROXY/ALL_PROXY env vars so that a
     // "direct" request is truly direct; only an explicitly chosen egress proxy
     // is applied.
+    let timeout = timeout_ms
+        .map(Duration::from_millis)
+        .filter(|d| !d.is_zero())
+        .unwrap_or(Duration::from_secs(90));
     let mut builder = reqwest::Client::builder()
-        .timeout(Duration::from_secs(90))
+        .timeout(timeout)
         .no_proxy()
         .redirect(reqwest::redirect::Policy::none());
     if let Some(name) = egress {
@@ -80,7 +88,7 @@ async fn send_once(
     egress: Option<&str>,
 ) -> Result<crate::protocol::TunnelResponse, String> {
     let start = Instant::now();
-    let client = build_client(state, egress).await?;
+    let client = build_client(state, egress, req.timeout_ms).await?;
 
     let method = Method::from_bytes(req.method.as_bytes()).unwrap_or(Method::GET);
     let mut rb = client.request(method, &req.url);
