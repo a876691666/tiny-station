@@ -1,0 +1,10 @@
+target
+
+.DS_Store
+
+*.nodeid
+
+dist
+
+tiny-station.toml
+/tiny-station-*
