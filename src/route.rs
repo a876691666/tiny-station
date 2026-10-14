@@ -1,50 +1,83 @@
+use crate::kernel::RouteQuery;
 use crate::net;
 use crate::protocol::{TunnelRequest, TunnelResponse};
 use crate::proxy;
 use crate::state::AppState;
+use crate::wire::Kind;
 use std::net::Ipv4Addr;
 
 const MAX_HOPS: usize = 16;
 
 /// Decide which node should execute a user request and with which egress.
+///
+/// A loaded kernel gets the first say: if its `route` hook returns a decision it
+/// wins, otherwise (or when the hook errors) the built-in resolution runs.
 pub async fn resolve(
     state: &AppState,
     target: &str,
     via: Option<&str>,
 ) -> (String, Option<String>) {
     let cfg = state.config().await;
-    let self_id = state.self_info.id.clone();
-    if let Some(v) = via.map(str::trim).filter(|v| !v.is_empty() && *v != "auto") {
-        match v {
-            "self" | "direct" | "local" => return (self_id, None),
-            _ => {}
-        }
-        {
-            let peers = state.peers.read().await;
-            if v == self_id || v == state.self_info.name {
-                return (self_id, None);
-            }
-            if peers.contains_key(v) {
-                return (v.to_string(), None);
-            }
-            if let Some((id, _)) = peers.iter().find(|(_, e)| e.info.name == v) {
-                return (id.clone(), None);
-            }
-            if cfg.proxies.iter().any(|p| p.name == v) {
-                return (self_id, Some(v.to_string()));
-            }
-            if state.find_proxy(v).await.is_some() {
-                return (self_id, Some(v.to_string()));
-            }
-            if let Some((id, _)) = peers
-                .iter()
-                .find(|(_, e)| e.proxies.iter().any(|p| p.name == v))
-            {
-                return (id.clone(), Some(v.to_string()));
+    if let Some(k) = state.kernel().await {
+        let parts = parts_of(target);
+        let q = RouteQuery {
+            url: target.to_string(),
+            host: parts.as_ref().map(|p| p.host.clone()).unwrap_or_default(),
+            port: parts.as_ref().and_then(|p| p.port).unwrap_or(0),
+            path: parts.as_ref().map(|p| p.path.clone()).unwrap_or_default(),
+            method: String::new(),
+        };
+        if let Some(d) = k.route(q).await {
+            if let Some(v) = d.via.as_deref() {
+                if let Some((dest, egress)) = explicit(state, &cfg, v).await {
+                    return (dest, d.egress.or(egress));
+                }
+            } else if d.egress.is_some() {
+                return (state.self_info.id.clone(), d.egress);
             }
         }
     }
+    if let Some(v) = via.map(str::trim).filter(|v| !v.is_empty() && *v != "auto") {
+        if let Some(r) = explicit(state, &cfg, v).await {
+            return r;
+        }
+    }
     auto(state, &cfg, target).await
+}
+
+/// Resolve an explicit `via` selector (node id/name, egress proxy name, `self`).
+async fn explicit(
+    state: &AppState,
+    cfg: &crate::config::Config,
+    v: &str,
+) -> Option<(String, Option<String>)> {
+    let self_id = state.self_info.id.clone();
+    if matches!(v, "self" | "direct" | "local") {
+        return Some((self_id, None));
+    }
+    let peers = state.peers.read().await;
+    if v == self_id || v == state.self_info.name {
+        return Some((self_id, None));
+    }
+    if peers.contains_key(v) {
+        return Some((v.to_string(), None));
+    }
+    if let Some((id, _)) = peers.iter().find(|(_, e)| e.info.name == v) {
+        return Some((id.clone(), None));
+    }
+    if cfg.proxies.iter().any(|p| p.name == v) {
+        return Some((self_id, Some(v.to_string())));
+    }
+    if state.find_proxy(v).await.is_some() {
+        return Some((self_id, Some(v.to_string())));
+    }
+    if let Some((id, _)) = peers
+        .iter()
+        .find(|(_, e)| e.proxies.iter().any(|p| p.name == v))
+    {
+        return Some((id.clone(), Some(v.to_string())));
+    }
+    None
 }
 
 async fn auto(state: &AppState, cfg: &crate::config::Config, target: &str) -> (String, Option<String>) {
@@ -141,23 +174,24 @@ pub async fn route_request(state: &AppState, mut tr: TunnelRequest) -> TunnelRes
                 r.path.insert(0, self_id);
                 return r;
             }
-            let url = format!("{}/api/tunnel", next.addr_url());
-            let rb = state.tunnel.post(&url).json(&tr);
-            let rb = match &next.auth {
-                Some((u, p)) => rb.basic_auth(u, Some(p)),
-                None => rb,
-            };
-            match rb.send().await {
-                Ok(resp) => match resp.json::<TunnelResponse>().await {
-                    Ok(mut r) => {
-                        r.path.insert(0, self_id);
-                        r
-                    }
-                    Err(e) => TunnelResponse::error(
-                        502,
-                        format!("下一跳 {} 返回无效响应: {}", next.info.name, e),
-                    ),
-                },
+            let base = next.addr_url();
+            match net::mesh_session_post::<TunnelRequest, TunnelResponse>(
+                state,
+                &state.tunnel,
+                &next.info.id,
+                &base,
+                "/api/tunnel",
+                &next.auth,
+                Kind::Tunnel,
+                &tr,
+                None,
+            )
+            .await
+            {
+                Ok(mut r) => {
+                    r.path.insert(0, self_id);
+                    r
+                }
                 Err(e) => TunnelResponse::error(
                     502,
                     format!("无法连接下一跳 {}: {}", next.info.name, e),

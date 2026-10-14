@@ -1,11 +1,18 @@
 mod api;
+mod atomic;
 mod config;
+mod crypto;
 mod dashboard;
+mod identity;
+mod kernel;
+mod keys;
 mod net;
 mod protocol;
 mod proxy;
+mod replay;
 mod route;
 mod state;
+mod wire;
 
 use anyhow::{bail, Context, Result};
 use clap::Parser;
@@ -19,6 +26,28 @@ struct Args {
     /// the executable; a starter config is generated on first run.
     #[arg(short, long)]
     config: Option<PathBuf>,
+    #[command(subcommand)]
+    cmd: Option<Cmd>,
+}
+
+#[derive(clap::Subcommand, Debug)]
+enum Cmd {
+    /// Generate an Ed25519 keypair for signing kernel bundles.
+    Keygen,
+    /// Sign a Luau kernel script into a distributable bundle (JSON on stdout).
+    Sign {
+        /// Path to the Luau script.
+        file: PathBuf,
+        /// Ed25519 secret key (hex), as printed by `keygen`.
+        #[arg(long)]
+        key: String,
+        /// Monotonic revision; must exceed the rev nodes have already accepted.
+        #[arg(long)]
+        rev: u64,
+        /// Human-readable version string.
+        #[arg(long, default_value = "")]
+        version: String,
+    },
 }
 
 #[tokio::main]
@@ -31,6 +60,32 @@ async fn main() -> Result<()> {
         .init();
 
     let args = Args::parse();
+    match args.cmd {
+        Some(Cmd::Keygen) => {
+            let (secret, public) = crypto::ed25519_keypair();
+            println!("secret (私钥,仅留在 CI/本机,切勿下发): {secret}");
+            println!("public (填入各节点配置 release_pubkey): {public}");
+            return Ok(());
+        }
+        Some(Cmd::Sign {
+            file,
+            key,
+            rev,
+            version,
+        }) => {
+            let set = kernel::disk::load(&file)
+                .with_context(|| format!("读取脚本/目录 {}", file.display()))?;
+            let mut bundle =
+                kernel::bundle::KernelBundle::new(&set, kernel::SUPPORTED_ABI, rev, &version);
+            bundle.sign_with(&key).map_err(|e| anyhow::anyhow!(e))?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&bundle).context("序列化 bundle")?
+            );
+            return Ok(());
+        }
+        None => {}
+    }
     let config_path = args.config.clone().unwrap_or_else(config::default_config_path);
     let (mut cfg, created) = if config_path.exists() {
         (config::Config::load(&config_path)?, false)
@@ -42,6 +97,13 @@ async fn main() -> Result<()> {
     let ip = cfg.advertised_ip();
     let bind = cfg.bind_ip();
     let ports = cfg.ports();
+
+    if cfg.mesh_key().is_none() {
+        bail!(
+            "未设置 mesh_key:节点间通讯强制加密,必须在 {} 中配置全网统一的 mesh_key",
+            config_path.display()
+        );
+    }
 
     if created {
         tracing::info!("已生成默认配置文件:{}", config_path.display());
@@ -93,12 +155,42 @@ async fn main() -> Result<()> {
         config_path.clone(),
         self_info.clone(),
         listen_port,
-    ));
+    )?);
     if state.api_auth().await.is_none() {
         tracing::warn!("未设置组网账号密码,组网接口无鉴权");
     }
     if state.admin_auth().await.is_none() {
         tracing::warn!("未设置管理账号密码,管理界面无鉴权");
+    }
+
+    // Load a Luau kernel script if one exists (hot-swappable at runtime via
+    // POST /api/kernel, without restarting).
+    let kernel_path = state.kernel_path().await;
+    if kernel_path.exists() {
+        match kernel::disk::load(&kernel_path) {
+            Ok(set) => {
+                match kernel::install(&state, &set, &kernel_path.display().to_string()).await {
+                    Ok(k) => {
+                        tracing::info!(
+                            "已加载内核 {} · v{} · abi {} · {} 模块 · {} worker",
+                            kernel_path.display(),
+                            k.info().version,
+                            k.info().abi,
+                            set.files.len(),
+                            k.info().workers
+                        );
+                        let mut meta = state.kernel_meta().await;
+                        if meta.version.is_empty() {
+                            meta.version = k.info().version.clone();
+                        }
+                        meta.sha256 = set.hash();
+                        state.set_kernel_meta(meta).await;
+                    }
+                    Err(e) => tracing::warn!("加载内核失败 {}: {}", kernel_path.display(), e),
+                }
+            }
+            Err(e) => tracing::warn!("读取内核失败 {}: {}", kernel_path.display(), e),
+        }
     }
 
     tracing::info!(

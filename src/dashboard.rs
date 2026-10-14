@@ -173,6 +173,22 @@ pub fn render(s: &StatusResponse, cfg: &Config) -> String {
     let cfg_json = serde_json::to_string(cfg)
         .unwrap_or_else(|_| "{}".into())
         .replace('<', "\\u003c");
+    let kernel_status = if s.kernel.loaded {
+        let mods = if s.kernel.files.is_empty() {
+            String::new()
+        } else {
+            format!(" · {} 模块: {}", s.kernel.files.len(), esc(&s.kernel.files.join(", ")))
+        };
+        format!(
+            "已加载 <b>{}</b> · rev {} · {} worker{}",
+            esc(&s.kernel.version),
+            s.kernel.rev,
+            s.kernel.workers,
+            mods
+        )
+    } else {
+        format!("未加载(当前 rev {})", s.kernel.rev)
+    };
 
     format!(
         r#"<!doctype html>
@@ -211,6 +227,16 @@ body{{padding-bottom:72px}}
 <div class="row"><input id="url" placeholder="https://example.com/api" value="http://127.0.0.1:8000/" style="width:min(560px,60%)">
 <input id="via" value="auto" style="width:260px"><button onclick="run()">发送</button></div>
 <pre id="out">就绪。</pre>
+
+<h2>内核 · 热升级(免重启)</h2>
+<div class="sub">粘贴入口脚本(main.lua)后点「仅本机升级」即热替换当前节点;「全网升级」会把新版推送到所有节点并自动生效。多模块内核请用 JSON <code>{{entry,files}}</code> 上传。当前:{kernel_status}</div>
+<textarea id="k-code" rows="10" placeholder="粘贴 Luau 入口脚本(参考 examples/kernel/)…"></textarea>
+<div class="row">
+<button onclick="kernelApply(false)">仅本机升级</button>
+<button onclick="kernelApply(true)">全网升级</button>
+<button class="ghost" onclick="kernelLoad()">载入当前脚本</button>
+<button class="ghost" onclick="kernelDelete()">卸载内核</button>
+<span id="k-toast"></span></div>
 
 <h2>配置管理</h2>
 <div class="sub">保存后立即写入文件并在运行时生效;修改 ip / bind / ports 需重启。</div>
@@ -286,6 +312,28 @@ async function run(){{
   }}catch(e){{out.textContent='请求失败: '+e;}}
 }}
 setInterval(()=>{{fetch('/api/status').then(r=>r.json()).catch(()=>{{}})}},5000);
+function kToast(m){{document.getElementById('k-toast').textContent=m;}}
+async function kernelApply(bc){{
+  const code=document.getElementById('k-code').value;
+  if(!code.trim()){{kToast('脚本为空');return;}}
+  if(bc&&!confirm('将把该脚本推送到全网所有节点并立即生效,确定?'))return;
+  kToast('升级中…');
+  try{{
+    const r=await fetch('/api/kernel?broadcast='+bc,{{method:'POST',headers:{{'content-type':'text/plain'}},body:code}});
+    const t=await r.text();
+    kToast(r.ok?('已升级 ✓ '+(bc?'已推送全网':'仅本机')):('失败: '+t));
+    if(r.ok)setTimeout(()=>location.reload(),800);
+  }}catch(e){{kToast('失败: '+e);}}
+}}
+async function kernelLoad(){{
+  try{{const r=await fetch('/api/kernel/source');document.getElementById('k-code').value=r.ok?await r.text():'';if(!r.ok)kToast('尚无脚本');}}
+  catch(e){{kToast(''+e);}}
+}}
+async function kernelDelete(){{
+  if(!confirm('卸载内核,回退内置行为?'))return;
+  await fetch('/api/kernel',{{method:'DELETE'}});
+  kToast('已卸载'); setTimeout(()=>location.reload(),600);
+}}
 </script>
 </body></html>"#,
         name = esc(&s.self_node.name),
@@ -315,5 +363,6 @@ setInterval(()=>{{fetch('/api/status').then(r=>r.json()).catch(()=>{{}})}},5000)
         caps = caps,
         egress_rows = egress_rows,
         cfg_json = cfg_json,
+        kernel_status = kernel_status,
     )
 }

@@ -1,16 +1,44 @@
 use crate::config::Config;
+use crate::crypto;
+use crate::identity::Identity;
+use crate::keys::KeyStore;
 use crate::protocol::{base_url, NodeInfo, ProxyInfo, ReverseTask, TunnelResponse};
+use crate::replay::ReplayCache;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::{mpsc, oneshot, Mutex, RwLock};
+use x25519_dalek::{PublicKey, StaticSecret};
 
 /// How long a hub holds a leaf's reverse poll open before answering "no work".
 pub const REVERSE_POLL_SECS: u64 = 20;
 /// A reverse channel is considered dead if the leaf hasn't polled within this.
 pub const REVERSE_STALE_MS: u64 = 60_000;
+/// How long a negotiated pairwise session key stays valid before re-handshake.
+pub const SESSION_TTL_MS: u64 = 300_000;
+/// How long this node's handshake ephemeral keypair is used before rotating.
+/// Rotating it provides forward secrecy across rotations.
+pub const EPHEMERAL_TTL_MS: u64 = 900_000;
+
+/// Current handshake ephemeral keypair: secret, public bytes, creation time.
+struct Ephemeral {
+    secret: StaticSecret,
+    public: [u8; 32],
+    created_ms: u64,
+}
+
+/// A negotiated pairwise session: an ephemeral ECDH key mixed with the cluster
+/// key, valid for a bounded time.
+#[derive(Clone, Debug)]
+pub struct Session {
+    pub key: [u8; 32],
+    /// The cluster epoch the peer reported at handshake time (used to decide
+    /// whether to push a newer cluster key to it).
+    pub peer_epoch: u64,
+    pub expires_ms: u64,
+}
 
 /// Hub-side handle for one NAT'd leaf's reverse channel.
 pub struct ReverseNode {
@@ -27,6 +55,16 @@ pub fn now_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
+}
+
+fn new_ephemeral() -> Ephemeral {
+    let secret = StaticSecret::from(crypto::random_bytes::<32>());
+    let public = PublicKey::from(&secret).to_bytes();
+    Ephemeral {
+        secret,
+        public,
+        created_ms: now_ms(),
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -91,6 +129,19 @@ pub struct AppState {
     pub self_info: NodeInfo,
     pub listen_port: u16,
     pub started: Instant,
+    /// This node's auto-generated X25519 identity.
+    pub identity: Identity,
+    /// Key that authenticates the enrollment handshake (derived from the root
+    /// `mesh_key`). Stable across cluster-key rotations.
+    pub handshake_key: [u8; 32],
+    /// Rotatable, versioned cluster key shared by the whole mesh.
+    pub keys: RwLock<KeyStore>,
+    /// This node's *current* handshake ephemeral keypair (rotated periodically).
+    eph: RwLock<Ephemeral>,
+    /// Per-peer negotiated session keys, keyed by peer node id.
+    pub sessions: RwLock<HashMap<String, Session>>,
+    /// Rejects replayed sealed messages inside the clock-skew window.
+    pub replay: ReplayCache,
     pub peers: RwLock<HashMap<String, PeerEntry>>,
     /// Last probe result per configured target address.
     pub targets: RwLock<HashMap<String, TargetStatus>>,
@@ -116,10 +167,27 @@ pub struct AppState {
     pub reverse_pending: RwLock<HashMap<String, oneshot::Sender<TunnelResponse>>>,
     /// Leaves we've already spawned a reverse poll loop for.
     pub reverse_loops: RwLock<HashSet<String>>,
+    /// Persistent key/value store exposed to kernel scripts (`ctx.store`).
+    pub kernel_store: Arc<crate::kernel::store::Store>,
+    /// The active hot-swappable kernel, if one is loaded.
+    pub kernel: RwLock<Option<Arc<crate::kernel::KernelHandle>>>,
+    /// Kernel metrics exposed to scripts (`ctx.metrics`).
+    pub kernel_metrics: Arc<crate::kernel::metrics::Metrics>,
+    /// Anti-rollback / current-revision bookkeeping for kernel bundles.
+    pub kernel_meta: RwLock<crate::kernel::bundle::KernelMeta>,
 }
 
 impl AppState {
-    pub fn new(cfg: Config, config_path: PathBuf, self_info: NodeInfo, listen_port: u16) -> Self {
+    pub fn new(
+        cfg: Config,
+        config_path: PathBuf,
+        self_info: NodeInfo,
+        listen_port: u16,
+    ) -> anyhow::Result<Self> {
+        let root = cfg.mesh_key().unwrap_or_default().to_string();
+        let identity = Identity::load_or_create(&crate::config::identity_file_for(&config_path))?;
+        let keys = KeyStore::load_or_init(&crate::config::cluster_file_for(&config_path), &root);
+        let handshake_key = crypto::handshake_key(root.as_bytes());
         let control = reqwest::Client::builder()
             .timeout(Duration::from_secs(4))
             .build()
@@ -128,12 +196,24 @@ impl AppState {
             .timeout(Duration::from_secs(120))
             .build()
             .expect("tunnel client");
-        AppState {
+        let kernel_store = Arc::new(crate::kernel::store::Store::load(
+            crate::config::kernel_store_file_for(&config_path),
+        ));
+        let kernel_meta = std::fs::read_to_string(crate::config::kernel_meta_file_for(&config_path))
+            .ok()
+            .and_then(|raw| serde_json::from_str(&raw).ok())
+            .unwrap_or_default();
+        Ok(AppState {
             cfg: RwLock::new(cfg),
             config_path,
             self_info,
             listen_port,
             started: Instant::now(),
+            identity,
+            handshake_key,
+            keys: RwLock::new(keys),
+            eph: RwLock::new(new_ephemeral()),
+            sessions: RwLock::new(HashMap::new()),
             peers: RwLock::new(HashMap::new()),
             targets: RwLock::new(HashMap::new()),
             reachable_live: RwLock::new(Vec::new()),
@@ -145,7 +225,12 @@ impl AppState {
             reverse: RwLock::new(HashMap::new()),
             reverse_pending: RwLock::new(HashMap::new()),
             reverse_loops: RwLock::new(HashSet::new()),
-        }
+            replay: ReplayCache::new(),
+            kernel_store,
+            kernel: RwLock::new(None),
+            kernel_metrics: Arc::new(crate::kernel::metrics::Metrics::default()),
+            kernel_meta: RwLock::new(kernel_meta),
+        })
     }
 
     /// Get (creating if needed) the reverse-channel slot for a leaf node.
@@ -261,11 +346,97 @@ impl AppState {
         *guard = cfg;
     }
 
+    /// Return this node's current handshake ephemeral keypair, rotating it when
+    /// it is older than `EPHEMERAL_TTL_MS`.
+    pub async fn ephemeral(&self) -> (StaticSecret, [u8; 32]) {
+        {
+            let g = self.eph.read().await;
+            if now_ms().saturating_sub(g.created_ms) < EPHEMERAL_TTL_MS {
+                return (g.secret.clone(), g.public);
+            }
+        }
+        let mut g = self.eph.write().await;
+        if now_ms().saturating_sub(g.created_ms) >= EPHEMERAL_TTL_MS {
+            *g = new_ephemeral();
+            tracing::debug!("已轮换握手临时密钥");
+        }
+        (g.secret.clone(), g.public)
+    }
+
+    /// A live (non-expired) session with `id`, if any.
+    pub async fn session(&self, id: &str) -> Option<Session> {
+        let s = self.sessions.read().await.get(id).cloned();
+        match s {
+            Some(x) if x.expires_ms > now_ms() => Some(x),
+            _ => None,
+        }
+    }
+
+    pub async fn put_session(&self, id: String, s: Session) {
+        self.sessions.write().await.insert(id, s);
+    }
+
+    pub async fn cluster_epoch(&self) -> u64 {
+        self.keys.read().await.epoch()
+    }
+
+    pub async fn cluster_key(&self) -> [u8; 32] {
+        self.keys.read().await.current_key()
+    }
+
+    /// Adopt a newer cluster key (from a handshake or a rotation broadcast).
+    pub async fn accept_rotation(&self, epoch: u64, key: [u8; 32]) -> bool {
+        self.keys.write().await.accept(epoch, key)
+    }
+
     pub async fn api_auth(&self) -> Option<(String, String)> {
         self.cfg.read().await.api_auth()
     }
 
     pub async fn admin_auth(&self) -> Option<(String, String)> {
         self.cfg.read().await.admin_auth()
+    }
+
+    /// The active kernel, if any. Callers on the hot path should clone this once
+    /// per request rather than holding the lock.
+    pub async fn kernel(&self) -> Option<Arc<crate::kernel::KernelHandle>> {
+        self.kernel.read().await.clone()
+    }
+
+    /// Install (or clear) the active kernel. Existing in-flight requests keep
+    /// their own `Arc` and finish on the old kernel.
+    pub async fn set_kernel(&self, k: Option<Arc<crate::kernel::KernelHandle>>) {
+        *self.kernel.write().await = k;
+    }
+
+    pub fn kernel_meta_path(&self) -> PathBuf {
+        crate::config::kernel_meta_file_for(&self.config_path)
+    }
+
+    pub fn kernel_prev_path(&self) -> PathBuf {
+        crate::config::kernel_prev_file_for(&self.config_path)
+    }
+
+    pub async fn kernel_path(&self) -> PathBuf {
+        self.cfg.read().await.kernel_path(&self.config_path)
+    }
+
+    /// The kernel module set currently installed on disk, if any.
+    pub async fn kernel_module_set(&self) -> Option<crate::kernel::ModuleSet> {
+        crate::kernel::disk::load(&self.kernel_path().await).ok()
+    }
+
+    pub async fn kernel_meta(&self) -> crate::kernel::bundle::KernelMeta {
+        self.kernel_meta.read().await.clone()
+    }
+
+    /// Persist a new kernel revision record (atomic write).
+    pub async fn set_kernel_meta(&self, m: crate::kernel::bundle::KernelMeta) {
+        if let Ok(raw) = serde_json::to_string(&m) {
+            if let Err(e) = crate::atomic::write(&self.kernel_meta_path(), raw.as_bytes()) {
+                tracing::warn!("内核 meta 落盘失败: {}", e);
+            }
+        }
+        *self.kernel_meta.write().await = m;
     }
 }

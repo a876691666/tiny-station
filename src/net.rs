@@ -1,10 +1,15 @@
 use crate::config::Target;
+use crate::crypto;
 use crate::protocol::{
-    base_url, GossipBody, NodeInfo, PeerView, ReversePoll, ReversePollResp, ReverseResult,
-    ReverseTask, TunnelRequest, TunnelResponse,
+    base_url, GossipBody, Hello, HelloAck, KeyRotate, NodeInfo, PeerView, Ping, ReachAnswer,
+    ReachQuery, ReversePoll, ReversePollResp, ReverseResult, ReverseTask, TunnelRequest,
+    TunnelResponse,
 };
 use crate::route;
-use crate::state::{now_ms, AppState, PeerEntry, REVERSE_POLL_SECS, REVERSE_STALE_MS};
+use crate::state::{
+    now_ms, AppState, PeerEntry, Session, REVERSE_POLL_SECS, REVERSE_STALE_MS, SESSION_TTL_MS,
+};
+use crate::wire::{self, Kind};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -21,35 +26,186 @@ fn apply_auth(rb: reqwest::RequestBuilder, auth: &Auth) -> reqwest::RequestBuild
     }
 }
 
-/// Probe a node, returning the failure reason on error.
-pub async fn probe(state: &AppState, ip: &str, port: u16, auth: &Auth) -> Result<NodeInfo, String> {
-    let url = format!("{}/api/self", base_url(ip, port));
-    let rb = state
-        .control
-        .get(url)
-        .timeout(Duration::from_millis(PROBE_TIMEOUT_MS));
-    let resp = apply_auth(rb, auth)
-        .send()
-        .await
-        .map_err(|e| {
-            if e.is_timeout() {
-                "连接超时(端口未开放,或被防火墙/安全组拦截)".to_string()
-            } else if e.is_connect() {
-                "无法建立连接(端口未开放,或被防火墙/安全组拦截)".to_string()
-            } else {
-                format!("连接失败: {}", e)
-            }
-        })?;
+fn connect_err(e: reqwest::Error) -> String {
+    if e.is_timeout() {
+        "连接超时(端口未开放,或被防火墙/安全组拦截)".to_string()
+    } else if e.is_connect() {
+        "无法建立连接(端口未开放,或被防火墙/安全组拦截)".to_string()
+    } else {
+        format!("连接失败: {}", e)
+    }
+}
+
+/// POST a sealed, privately-encoded message under `key` and open the sealed
+/// reply. `sender` sets the `x-ts-node` header so the receiver can pick the
+/// right pairwise session key.
+#[allow(clippy::too_many_arguments)]
+async fn post_sealed<B, R>(
+    client: &reqwest::Client,
+    url: &str,
+    auth: &Auth,
+    key: &[u8; 32],
+    kind: Kind,
+    body: &B,
+    timeout: Option<Duration>,
+    sender: Option<&str>,
+) -> Result<R, String>
+where
+    B: serde::Serialize,
+    R: serde::de::DeserializeOwned,
+{
+    let payload = wire::pack(key, kind, body);
+    let mut rb = client
+        .post(url)
+        .header("content-type", "application/octet-stream")
+        .body(payload);
+    if let Some(id) = sender {
+        rb = rb.header("x-ts-node", id);
+    }
+    rb = apply_auth(rb, auth);
+    if let Some(t) = timeout {
+        rb = rb.timeout(t);
+    }
+    let resp = rb.send().await.map_err(connect_err)?;
     let status = resp.status();
     if status == reqwest::StatusCode::UNAUTHORIZED {
         return Err("认证失败(账号或密码不对)".to_string());
     }
     if !status.is_success() {
-        return Err(format!("对方返回 HTTP {}", status.as_u16()));
+        let text = resp.text().await.unwrap_or_default();
+        return Err(if text.trim().is_empty() {
+            format!("对方返回 HTTP {}", status.as_u16())
+        } else {
+            format!("对方返回 HTTP {}: {}", status.as_u16(), text.trim())
+        });
     }
-    resp.json::<NodeInfo>()
+    let bytes = resp
+        .bytes()
         .await
-        .map_err(|e| format!("响应解析失败: {}", e))
+        .map_err(|e| format!("读取响应失败: {}", e))?;
+    wire::unpack::<R>(key, kind, &bytes, None)
+}
+
+/// Enrollment handshake with a peer: authenticate with the root key, negotiate
+/// an ephemeral session key, and reconcile the cluster key. Returns the peer's
+/// identity and the negotiated session (also cached by peer id).
+pub async fn handshake(
+    state: &AppState,
+    base: &str,
+    auth: &Auth,
+) -> Result<(NodeInfo, Session), String> {
+    let (eph, eph_pub) = state.ephemeral().await;
+    let (epoch, cluster) = {
+        let ks = state.keys.read().await;
+        (ks.epoch(), ks.current_key())
+    };
+    let hello = Hello {
+        node: state.self_info.clone(),
+        id_pub: state.identity.pubkey(),
+        eph_pub,
+        epoch,
+        cluster,
+    };
+    let url = format!("{}/api/handshake", base);
+    let ack: HelloAck = post_sealed(
+        &state.control,
+        &url,
+        auth,
+        &state.handshake_key,
+        Kind::Handshake,
+        &hello,
+        Some(Duration::from_millis(PROBE_TIMEOUT_MS)),
+        None,
+    )
+    .await?;
+
+    // Converge on the newer cluster key under the `(epoch, key)` total order, so
+    // two concurrent rotations at the same epoch can't split the mesh.
+    let (win_epoch, win_key) = crate::keys::newer((epoch, cluster), (ack.epoch, ack.cluster));
+    if (win_epoch, win_key) != (epoch, cluster) {
+        state.accept_rotation(win_epoch, win_key).await;
+    }
+    let key = crypto::derive_session(
+        &eph,
+        state.identity.secret(),
+        ack.eph_pub,
+        ack.id_pub,
+        &win_key,
+    );
+    let session = Session {
+        key,
+        peer_epoch: ack.epoch,
+        expires_ms: now_ms() + SESSION_TTL_MS,
+    };
+    state
+        .put_session(ack.node.id.clone(), session.clone())
+        .await;
+    Ok((ack.node, session))
+}
+
+/// Return a live session with `id`, handshaking on demand.
+pub async fn ensure_session(
+    state: &AppState,
+    id: &str,
+    base: &str,
+    auth: &Auth,
+) -> Result<Session, String> {
+    if let Some(s) = state.session(id).await {
+        return Ok(s);
+    }
+    let (_info, s) = handshake(state, base, auth).await?;
+    Ok(s)
+}
+
+/// POST a session-sealed message to a specific peer (handshake first if needed).
+#[allow(clippy::too_many_arguments)]
+pub async fn mesh_session_post<B, R>(
+    state: &AppState,
+    client: &reqwest::Client,
+    id: &str,
+    base: &str,
+    path: &str,
+    auth: &Auth,
+    kind: Kind,
+    body: &B,
+    timeout: Option<Duration>,
+) -> Result<R, String>
+where
+    B: serde::Serialize,
+    R: serde::de::DeserializeOwned,
+{
+    let sess = ensure_session(state, id, base, auth).await?;
+    let url = format!("{}{}", base, path);
+    match post_sealed(
+        client,
+        &url,
+        auth,
+        &sess.key,
+        kind,
+        body,
+        timeout,
+        Some(&state.self_info.id),
+    )
+    .await
+    {
+        Ok(v) => Ok(v),
+        Err(e) => {
+            // A stale session (peer restarted or rotated its ephemeral) fails
+            // here; drop it so the next attempt re-handshakes. We deliberately
+            // do not retry inline, to avoid double-executing non-idempotent
+            // requests (e.g. a POST tunnel).
+            state.sessions.write().await.remove(id);
+            Err(e)
+        }
+    }
+}
+
+/// Probe a node (which also establishes/refreshes the pairwise session),
+/// returning the failure reason on error.
+pub async fn probe(state: &AppState, ip: &str, port: u16, auth: &Auth) -> Result<NodeInfo, String> {
+    let base = base_url(ip, port);
+    let (info, _sess) = handshake(state, &base, auth).await?;
+    Ok(info)
 }
 
 /// Query a candidate node's identity.
@@ -135,15 +291,14 @@ async fn reachable_ip(state: &AppState, ip: &str) -> bool {
 /// A cheap TCP connect probe used to verify that a declared `reachable`
 /// service is actually up from this node right now.
 async fn probe_tcp(host: &str, port: u16) -> bool {
-    match tokio::time::timeout(
-        Duration::from_secs(2),
-        tokio::net::TcpStream::connect((host, port)),
+    matches!(
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            tokio::net::TcpStream::connect((host, port)),
+        )
+        .await,
+        Ok(Ok(_))
     )
-    .await
-    {
-        Ok(Ok(_)) => true,
-        _ => false,
-    }
 }
 
 /// Can this node reach `host:port` — either directly or through one of its live
@@ -334,6 +489,7 @@ async fn health_round(state: &AppState) {
         // Always dial the address that actually worked (config address), never
         // the peer's self-advertised address which may be a private/NAT IP.
         let (pip, pport) = dial.clone().unwrap_or((info.ip.clone(), info.port));
+        let base = base_url(&pip, pport);
         let start = Instant::now();
         match probe(state, &pip, pport, &auth).await {
             Ok(fresh) => {
@@ -348,7 +504,7 @@ async fn health_round(state: &AppState) {
                         e.last_seen_ms = now_ms();
                     }
                 }
-                pull_view(state, &base_url(&pip, pport), &auth).await;
+                pull_view(state, &id, &base, &auth).await;
             }
             Err(reason) => {
                 // The port may have changed; try scanning the configured ports.
@@ -367,7 +523,7 @@ async fn health_round(state: &AppState) {
                                 e.last_seen_ms = now_ms();
                             }
                         }
-                        pull_view(state, &base_url(&pip, found_port), &auth).await;
+                        pull_view(state, &id, &base_url(&pip, found_port), &auth).await;
                     }
                 } else {
                     mark_unreachable(state, &id, reason).await;
@@ -381,38 +537,147 @@ async fn is_known(state: &AppState, id: &str) -> bool {
     state.peers.read().await.contains_key(id)
 }
 
-async fn pull_view(state: &AppState, base: &str, auth: &Auth) {
-    let url = format!("{}/api/peers", base);
-    let rb = state.control.get(url);
-    if let Ok(resp) = apply_auth(rb, auth).send().await {
-        if let Ok(body) = resp.json::<GossipBody>().await {
-            merge_view(state, body.view).await;
-        }
+async fn pull_view(state: &AppState, id: &str, base: &str, auth: &Auth) {
+    if let Ok(body) = mesh_session_post::<Ping, GossipBody>(
+        state,
+        &state.control,
+        id,
+        base,
+        "/api/peers",
+        auth,
+        Kind::Peers,
+        &Ping,
+        None,
+    )
+    .await
+    {
+        merge_view(state, body.view).await;
     }
 }
 
 async fn gossip_round(state: &AppState) {
     let view = build_view(state).await;
-    let targets: Vec<(String, Auth)> = state
+    let targets: Vec<(String, String, Auth)> = state
         .peers
         .read()
         .await
         .values()
         .filter(|e| e.directly_reachable && e.dial.is_some())
-        .map(|e| (e.addr_url(), e.auth.clone()))
+        .map(|e| (e.info.id.clone(), e.addr_url(), e.auth.clone()))
         .collect();
-    for (base, auth) in targets {
-        let url = format!("{}/api/gossip", base);
-        let rb = state
-            .control
-            .post(&url)
-            .json(&GossipBody { view: view.clone() })
-            .timeout(Duration::from_secs(4));
-        if let Ok(resp) = apply_auth(rb, &auth).send().await {
-            if let Ok(body) = resp.json::<GossipBody>().await {
-                merge_view(state, body.view).await;
-            }
+    for (id, base, auth) in targets {
+        if let Ok(body) = mesh_session_post::<GossipBody, GossipBody>(
+            state,
+            &state.control,
+            &id,
+            &base,
+            "/api/gossip",
+            &auth,
+            Kind::Gossip,
+            &GossipBody { view: view.clone() },
+            Some(Duration::from_secs(4)),
+        )
+        .await
+        {
+            merge_view(state, body.view).await;
         }
+    }
+    propagate_rotation(state).await;
+}
+
+/// Push our cluster key to any directly-reachable peer whose last handshake
+/// reported an older epoch, so rotations spread across the whole mesh.
+async fn propagate_rotation(state: &AppState) {
+    let epoch = state.cluster_epoch().await;
+    if epoch == 0 {
+        return;
+    }
+    let key = state.cluster_key().await;
+    let targets: Vec<(String, String, Auth)> = state
+        .peers
+        .read()
+        .await
+        .values()
+        .filter(|e| e.directly_reachable && e.dial.is_some())
+        .map(|e| (e.info.id.clone(), e.addr_url(), e.auth.clone()))
+        .collect();
+    for (id, base, auth) in targets {
+        let behind = matches!(state.session(&id).await, Some(s) if s.peer_epoch < epoch);
+        if !behind {
+            continue;
+        }
+        let _ = mesh_session_post::<KeyRotate, Ping>(
+            state,
+            &state.control,
+            &id,
+            &base,
+            "/api/keyrotate",
+            &auth,
+            Kind::KeyRotate,
+            &KeyRotate { epoch, key },
+            Some(Duration::from_secs(4)),
+        )
+        .await;
+    }
+}
+
+/// Broadcast a rotation immediately to every peer we hold a session with.
+pub async fn broadcast_rotation(state: &AppState, epoch: u64, key: [u8; 32]) {
+    let targets: Vec<(String, String, Auth)> = state
+        .peers
+        .read()
+        .await
+        .values()
+        .filter(|e| e.directly_reachable && e.dial.is_some())
+        .map(|e| (e.info.id.clone(), e.addr_url(), e.auth.clone()))
+        .collect();
+    for (id, base, auth) in targets {
+        if state.session(&id).await.is_none() {
+            continue;
+        }
+        let _ = mesh_session_post::<KeyRotate, Ping>(
+            state,
+            &state.control,
+            &id,
+            &base,
+            "/api/keyrotate",
+            &auth,
+            Kind::KeyRotate,
+            &KeyRotate { epoch, key },
+            Some(Duration::from_secs(4)),
+        )
+        .await;
+    }
+}
+
+/// Broadcast a signed kernel bundle to every directly-reachable peer we hold a
+/// session with. Receivers verify the signature and re-propagate, so the bundle
+/// spreads across the whole mesh.
+pub async fn broadcast_kernel(state: &AppState, bundle: &crate::kernel::bundle::KernelBundle) {
+    let targets: Vec<(String, String, Auth)> = state
+        .peers
+        .read()
+        .await
+        .values()
+        .filter(|e| e.directly_reachable && e.dial.is_some())
+        .map(|e| (e.info.id.clone(), e.addr_url(), e.auth.clone()))
+        .collect();
+    for (id, base, auth) in targets {
+        if state.session(&id).await.is_none() {
+            continue;
+        }
+        let _ = mesh_session_post::<_, Ping>(
+            state,
+            &state.control,
+            &id,
+            &base,
+            "/api/kernel/sync",
+            &auth,
+            Kind::KernelAnnounce,
+            bundle,
+            Some(Duration::from_secs(8)),
+        )
+        .await;
     }
 }
 
@@ -487,14 +752,6 @@ pub async fn merge_view(state: &AppState, list: Vec<PeerView>) {
     }
 }
 
-#[derive(serde::Deserialize)]
-struct ReachResp {
-    #[serde(default)]
-    reachable: bool,
-    #[serde(default)]
-    egress: Option<String>,
-}
-
 /// On-demand discovery: ask directly-connected peers whether they can reach
 /// `host:port` (directly or via an egress proxy) and return the first owner.
 /// This lets a request for another node's `127.0.0.1:39181` find that node
@@ -524,19 +781,37 @@ pub async fn discover_owner(
         .map(|(id, e)| (id.clone(), e.addr_url(), e.auth.clone()))
         .collect();
 
-    let client = state.control.clone();
-    let mut set = tokio::task::JoinSet::new();
+    // Establish sessions up front, then fan out the queries in parallel.
+    let mut jobs: Vec<(String, String, Auth, [u8; 32])> = Vec::new();
     for (id, base, auth) in targets {
+        if let Ok(sess) = ensure_session(state, &id, &base, &auth).await {
+            jobs.push((id, base, auth, sess.key));
+        }
+    }
+
+    let client = state.control.clone();
+    let host = host.to_string();
+    let mut set = tokio::task::JoinSet::new();
+    for (id, base, auth, key) in jobs {
         let client = client.clone();
-        let url = format!("{}/api/reach?host={}&port={}", base, host, port);
+        let host = host.clone();
+        let url = format!("{}/api/reach", base);
         set.spawn(async move {
-            let rb = client.get(url).timeout(Duration::from_secs(3));
-            let resp = apply_auth(rb, &auth).send().await.ok()?;
-            let j: ReachResp = resp.json().await.ok()?;
-            if j.reachable {
-                Some((id, j.egress))
-            } else {
-                None
+            let q = ReachQuery { host, port };
+            match post_sealed::<ReachQuery, ReachAnswer>(
+                &client,
+                &url,
+                &auth,
+                &key,
+                Kind::Reach,
+                &q,
+                Some(Duration::from_secs(3)),
+                None,
+            )
+            .await
+            {
+                Ok(a) if a.reachable => Some((id, a.egress)),
+                _ => None,
             }
         });
     }
@@ -721,33 +996,36 @@ async fn reverse_poll_loop(state: Arc<AppState>, peer_id: String) {
             tokio::time::sleep(Duration::from_secs(2)).await;
             continue;
         };
-        let url = format!("{}/api/reverse/poll", base);
         let poll = ReversePoll {
             node: state.self_info.clone(),
             result: carry.take(),
         };
-        let rb = state
-            .tunnel
-            .post(&url)
-            .json(&poll)
-            .timeout(Duration::from_secs(REVERSE_POLL_SECS + 15));
-        match apply_auth(rb, &auth).send().await {
-            Ok(resp) => match resp.json::<ReversePollResp>().await {
-                Ok(body) => {
-                    if let Some(task) = body.task {
-                        let mut tr = task.request;
-                        if tr.dest.is_empty() {
-                            tr.dest = state.self_info.id.clone();
-                        }
-                        let response = route::route_request(&state, tr).await;
-                        carry = Some(ReverseResult {
-                            req_id: task.req_id,
-                            response,
-                        });
+        match mesh_session_post::<ReversePoll, ReversePollResp>(
+            &state,
+            &state.tunnel,
+            &peer_id,
+            &base,
+            "/api/reverse/poll",
+            &auth,
+            Kind::ReversePoll,
+            &poll,
+            Some(Duration::from_secs(REVERSE_POLL_SECS + 15)),
+        )
+        .await
+        {
+            Ok(body) => {
+                if let Some(task) = body.task {
+                    let mut tr = task.request;
+                    if tr.dest.is_empty() {
+                        tr.dest = state.self_info.id.clone();
                     }
+                    let response = route::route_request(&state, tr).await;
+                    carry = Some(ReverseResult {
+                        req_id: task.req_id,
+                        response,
+                    });
                 }
-                Err(_) => tokio::time::sleep(Duration::from_secs(1)).await,
-            },
+            }
             Err(_) => tokio::time::sleep(Duration::from_secs(1)).await,
         }
     }

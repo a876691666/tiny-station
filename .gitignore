@@ -3,6 +3,12 @@ target
 .DS_Store
 
 *.nodeid
+*.identity
+*.clusterkey
+*.kernel.lua
+*.kernel.json
+*.kernel.meta
+*.kernel.prev.lua
 
 dist
 

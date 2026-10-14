@@ -46,6 +46,13 @@ pub struct Config {
     pub api_username: Option<String>,
     #[serde(default)]
     pub api_password: Option<String>,
+    /// Shared, non-public mesh key. Every node must set the SAME value. All
+    /// node-to-node traffic (heartbeat/control and proxy/data plane) is encoded
+    /// with a private binary protocol and encrypted with a key derived from
+    /// this passphrase via HKDF-SHA256. Required: the mesh refuses to start
+    /// without it.
+    #[serde(default)]
+    pub mesh_key: Option<String>,
     /// Credential required to open the web management UI / status API.
     /// Falls back to the api credential when unset.
     #[serde(default)]
@@ -69,6 +76,26 @@ pub struct Config {
     /// Seconds between discovery/health/gossip rounds.
     #[serde(default)]
     pub gossip_interval_secs: Option<u64>,
+    /// Optional path to a Luau kernel script (relative paths are resolved
+    /// against the config directory). Defaults to a sibling file
+    /// `.<config-stem>.kernel.lua`; loaded at startup when it exists.
+    #[serde(default)]
+    pub kernel_file: Option<String>,
+    /// Number of independent Lua VMs (worker threads) for the kernel. Defaults
+    /// to 1.
+    #[serde(default)]
+    pub kernel_workers: Option<usize>,
+    /// Ed25519 public key (hex) that signs distributed kernel bundles. When set,
+    /// a signed bundle whose signer matches is the ONLY thing a node will accept
+    /// from the mesh. Keep the matching private key off every node (CI only).
+    #[serde(default)]
+    pub release_pubkey: Option<String>,
+    /// Allow unsigned kernel bundles pushed by mesh peers. Defaults true: mesh
+    /// traffic is already authenticated by the `mesh_key` handshake + session
+    /// keys (same trust model as cluster-key rotation), so a signature is only
+    /// *optional* hardening via `release_pubkey`. Set false to require signing.
+    #[serde(default)]
+    pub kernel_allow_unsigned: Option<bool>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -115,7 +142,8 @@ impl Config {
 
     pub fn save(&self, path: &Path) -> Result<()> {
         let raw = toml::to_string_pretty(self).context("serializing config")?;
-        std::fs::write(path, raw).with_context(|| format!("writing config {}", path.display()))?;
+        crate::atomic::write(path, raw.as_bytes())
+            .with_context(|| format!("writing config {}", path.display()))?;
         Ok(())
     }
 
@@ -163,11 +191,51 @@ impl Config {
         self.auto_proxy_scan.unwrap_or(true)
     }
 
+    /// Number of kernel worker VMs (each is a dedicated Lua thread).
+    pub fn kernel_workers(&self) -> usize {
+        self.kernel_workers.unwrap_or(1).clamp(1, 32)
+    }
+
+    /// Effective path of the kernel script.
+    pub fn kernel_path(&self, config_path: &Path) -> PathBuf {
+        match &self.kernel_file {
+            Some(p) if !p.trim().is_empty() => {
+                let pb = PathBuf::from(p.trim());
+                if pb.is_absolute() {
+                    pb
+                } else {
+                    config_path
+                        .parent()
+                        .unwrap_or_else(|| Path::new("."))
+                        .join(pb)
+                }
+            }
+            _ => kernel_file_for(config_path),
+        }
+    }
+
+    /// The pinned release public key (hex), if configured and non-empty.
+    pub fn release_pubkey(&self) -> Option<&str> {
+        self.release_pubkey
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+    }
+
+    pub fn kernel_allow_unsigned(&self) -> bool {
+        self.kernel_allow_unsigned.unwrap_or(true)
+    }
+
     pub fn api_auth(&self) -> Option<(String, String)> {
         match (&self.api_username, &self.api_password) {
             (Some(u), Some(p)) if !u.is_empty() => Some((u.clone(), p.clone())),
             _ => None,
         }
+    }
+
+    /// The shared mesh key, if set and non-empty.
+    pub fn mesh_key(&self) -> Option<&str> {
+        self.mesh_key.as_deref().map(str::trim).filter(|s| !s.is_empty())
     }
 
     pub fn admin_auth(&self) -> Option<(String, String)> {
@@ -217,12 +285,48 @@ pub fn detect_local_ip() -> Option<String> {
 
 /// Resolve the persistent node id file next to the config.
 pub fn id_file_for(config_path: &Path) -> PathBuf {
+    sibling_file(config_path, "nodeid")
+}
+
+/// Auto-generated X25519 identity key file.
+pub fn identity_file_for(config_path: &Path) -> PathBuf {
+    sibling_file(config_path, "identity")
+}
+
+/// Persisted, rotatable cluster key file.
+pub fn cluster_file_for(config_path: &Path) -> PathBuf {
+    sibling_file(config_path, "clusterkey")
+}
+
+/// Default kernel path (a directory of `.lua` modules, sibling of the config).
+/// A path ending in `.lua` selects single-file mode instead.
+pub fn kernel_file_for(config_path: &Path) -> PathBuf {
+    sibling_file(config_path, "kernel")
+}
+
+/// Kernel key/value store file (sibling of the config).
+pub fn kernel_store_file_for(config_path: &Path) -> PathBuf {
+    sibling_file(config_path, "kernel.json")
+}
+
+/// Kernel anti-rollback / current-revision file (sibling of the config).
+pub fn kernel_meta_file_for(config_path: &Path) -> PathBuf {
+    sibling_file(config_path, "kernel.meta")
+}
+
+/// Previous kernel module set, kept for `POST /api/kernel/rollback`.
+pub fn kernel_prev_file_for(config_path: &Path) -> PathBuf {
+    sibling_file(config_path, "kernel.prev.json")
+}
+
+/// `dir/.<config-stem>.<ext>` — a hidden sibling of the config file.
+fn sibling_file(config_path: &Path, ext: &str) -> PathBuf {
     let mut p = config_path.to_path_buf();
     let stem = p
         .file_stem()
         .map(|s| s.to_string_lossy().to_string())
         .unwrap_or_else(|| "tiny-station".to_string());
-    p.set_file_name(format!(".{}.nodeid", stem));
+    p.set_file_name(format!(".{}.{}", stem, ext));
     p
 }
 
@@ -235,7 +339,8 @@ pub fn load_or_create_id(config_path: &Path) -> Result<String> {
         }
     }
     let id = uuid::Uuid::new_v4().to_string();
-    std::fs::write(&path, &id).with_context(|| format!("writing id {}", path.display()))?;
+    crate::atomic::write(&path, id.as_bytes())
+        .with_context(|| format!("writing id {}", path.display()))?;
     Ok(id)
 }
 
@@ -265,7 +370,7 @@ pub fn pin_port_file(path: &Path, port: u16) -> Result<()> {
     if !out.ends_with('\n') {
         out.push('\n');
     }
-    std::fs::write(path, out)
+    crate::atomic::write(path, out.as_bytes())
         .with_context(|| format!("pinning port in {}", path.display()))?;
     Ok(())
 }
@@ -369,11 +474,22 @@ fn hostname() -> String {
         .unwrap_or_else(|| "tiny-station".to_string())
 }
 
+/// A fresh random mesh key (32 random bytes, base64-encoded) for first-run
+/// config generation. The operator copies it to every node.
+pub fn random_mesh_key() -> String {
+    use base64::{engine::general_purpose::STANDARD, Engine};
+    use rand::RngCore;
+    let mut bytes = [0u8; 32];
+    rand::rngs::OsRng.fill_bytes(&mut bytes);
+    STANDARD.encode(bytes)
+}
+
 /// Write a commented starter config and return it. Credentials use the fixed
 /// default password `123456` so the mesh works out of the box; change it for
 /// any untrusted network.
 pub fn write_default(path: &Path) -> Result<Config> {
     let name = hostname();
+    let mesh_key = random_mesh_key();
     let template = format!(
         r#"# tiny-station 配置文件(首次运行自动生成)
 # 通常只需要填写 ip(不填则自动探测内网地址)。
@@ -386,7 +502,17 @@ name = "{name}"
 # ports = [45910, 45911, 45912, 45913, 45914]
 # port = 45910              # 固定监听端口(首次运行后自动写入,一般不用手改)
 
+# 全网统一的【根密钥 / 入网密钥】,所有节点必须填完全相同的值。
+# 它只用于握手认证(PSK)和新节点入网,不直接加密消息。节点间会话密钥由
+# 自动生成的身份密钥 + 临时 ECDH 动态协商;真正用于消息加密的是一个可轮换的
+# cluster key(可通过管理接口 POST /api/rotate 设置并自动广播到全网,后加入的
+# 节点会在入网握手中自动同步最新值)。
+# 首次运行自动生成了一串随机值 —— 请把它原样复制到其它节点的配置里;
+# 不设置将拒绝启动。
+mesh_key = "{mesh_key}"
+
 # 其它节点访问本节点时需要提供的组网账号密码。
+# 注意:这只是额外的 Basic 认证;真正的机密性/完整性由上面的 mesh_key 保证。
 api_username = "mesh"
 api_password = "123456"
 
@@ -423,7 +549,7 @@ gossip_interval_secs = 5
 # password = "对方的组网密码"
 "#
     );
-    std::fs::write(path, &template)
+    crate::atomic::write(path, template.as_bytes())
         .with_context(|| format!("writing default config {}", path.display()))?;
     let cfg: Config =
         toml::from_str(&template).context("parsing generated default config")?;

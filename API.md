@@ -93,22 +93,51 @@ POST /proxy?target=https://example.com/upload&via=auto
 
 除特别说明外均需 Basic 鉴权。`/api/status`、`/api/config`、`/` 需要管理鉴权。
 
+控制面中节点间使用的接口(`/api/handshake`、`/api/peers`、`/api/gossip`、`/api/reach`、`/api/tunnel`、
+`/api/reverse/poll`、`/api/keyrotate`)全部为 `POST`,请求与响应 body 都是**私有二进制编码 + 加密的信封**
+(`Content-Type: application/octet-stream`)。除握手外,请求需带 `X-TS-Node: <发送方节点id>` 头以定位配对会话密钥。
+握手用全网统一的 `mesh_key`(根/入网密钥)派生密钥加密,其余用配对会话密钥(自动协商)。下表描述语义载荷。
+
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
-| GET | `/api/self` | 本节点身份信息 `{id,name,ip,port,version}` |
-| GET | `/api/peers` | 本节点广播的全网视图 |
+| POST | `/api/handshake` | 入网握手:交换身份+临时公钥,协商会话密钥并同步 cluster key(根密钥加密) |
+| POST | `/api/peers` | 拉取本节点广播的全网视图 |
 | POST | `/api/gossip` | 合并对方视图并返回自己的视图(节点间使用) |
-| GET | `/api/status` | 全量状态:节点、路由、能力、出口、端口等 |
+| POST | `/api/reach` | 探测本节点能否直达某目标,收发 `{host,port}` / `{reachable,egress}` |
+| POST | `/api/tunnel` | 节点间隧道协议(内部使用,收发 `TunnelRequest` / `TunnelResponse`) |
+| POST | `/api/reverse/poll` | 反向通道长轮询(NAT 节点 → 中心节点,内部使用) |
+| POST | `/api/keyrotate` | 接收并采用对方的 cluster key 轮换(epoch 更新时) |
+| GET | `/api/status` | 全量状态:节点、路由、能力、出口、端口、`cluster_epoch` 等 |
 | GET | `/api/config` | 读取完整配置 |
 | POST | `/api/config` | 覆盖写入配置(立即生效,`ip`/`bind`/`ports` 需重启) |
-| GET | `/api/reach?host=&port=` | 探测本节点能否直达某目标,返回 `{reachable,egress}` |
-| POST | `/api/tunnel` | 节点间隧道协议(内部使用,接收 `TunnelRequest`) |
-| POST | `/api/reverse/poll` | 反向通道长轮询(NAT 节点 → 中心节点,内部使用) |
+| POST | `/api/rotate` | **管理接口**:设置新 cluster key `{"mesh_key":"新值"}`(省略则随机)并广播全网 |
+| GET | `/api/kernel` | **管理接口**:查看当前内核状态(`{loaded,abi,version,workers,source,rev,metrics,files}`) |
+| POST | `/api/kernel` | **管理接口**:上传内核。纯文本 = `main.lua`(保留其它模块);JSON `{entry,files:{...}}` = 整包替换。编译后热替换并落盘;`?broadcast=true` 推送全网 |
+| GET | `/api/kernel/source` | **管理接口**:返回入口模块(`main.lua`)原文(供管理界面编辑器) |
+| POST | `/api/kernel/reload` | **管理接口**:从磁盘上的内核文件重新加载 |
+| POST | `/api/kernel/rollback` | **管理接口**:回滚到上一版内核(防回滚基线保留) |
+| POST | `/api/kernel/distribute` | **管理接口**:上传**已签名** bundle(JSON),验签+防回滚后本地生效并广播全网(`?broadcast=false` 仅本节点灰度) |
+| POST | `/api/kernel/sync` | **节点间**:内核 bundle 广播(会话密钥加密,内部使用) |
+| DELETE | `/api/kernel` | **管理接口**:卸载内核,回退到内置行为 |
+| ANY | `/x/*` | 内核自定义端点(需组网账号鉴权);无内核或路径未注册时 404 |
 | GET | `/` | 网页管理界面 |
 
 > **NAT 穿透**:位于 NAT 后、只能出站的节点会自动向配置的 `peers` 发起 `/api/reverse/poll` 长轮询。
 > 对端可经该通道向它下发请求,因此**单向配置即可双向访问**,且**绝不回拨**对方广播的 IP。
 > 详见 [README](README.md#位于-nat-后的节点反向通道)。
+
+> **密钥轮换**:任一节点管理员 `POST /api/rotate` 后,该节点立即换用新 cluster key 并广播;
+> 收到 `/api/keyrotate`(epoch 更新)的节点持久化新密钥并在下一轮 gossip 继续传播。
+> **后加入的节点**用根密钥 `mesh_key` 完成 `/api/handshake` 时,会从对端收到当前 cluster key,
+> 因此无论期间轮换过多少次都能自动同步最新值。
+
+> **可热替换内核**:`POST /api/kernel` 上传一段 Luau 脚本(非 JSON,纯文本 body),
+> 节点先编译校验(`abi` 必须为 1),成功后**热替换当前内核并落盘**,无需重启。
+> 加 `?broadcast=true` 会把该版本推送到全网所有节点立即生效。管理界面「内核 · 热升级」
+> 面板提供同样的**一键升级**。默认信任已认证的 mesh 会话;配置 `release_pubkey` 后则
+> 强制签名校验(见 `POST /api/kernel/distribute`)。脚本可覆盖路由(`route`)、出站请求/
+> 响应变换(`on_request` / `on_response`)与自定义端点(`endpoints`)。详见
+> [README](README.md#可热替换内核luau) 与 [`examples/kernel.lua`](examples/kernel.lua)。
 
 ---
 

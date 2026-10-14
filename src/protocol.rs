@@ -51,6 +51,59 @@ pub struct GossipBody {
     pub view: Vec<PeerView>,
 }
 
+/// Empty payload for request/response pairs that carry no data of their own
+/// (identity probe, peer-view pull). Still timestamped + sealed on the wire.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Ping;
+
+/// `POST /api/reach` request: ask a peer whether it can reach `host:port`.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ReachQuery {
+    pub host: String,
+    pub port: u16,
+}
+
+/// `POST /api/reach` reply.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ReachAnswer {
+    pub reachable: bool,
+    #[serde(default)]
+    pub egress: Option<String>,
+}
+
+// ---------------- secure channel (enrollment + rotation) ----------------
+
+/// Handshake request, sealed with the root handshake key (PSK). Carries the
+/// sender's static identity, its current ephemeral X25519 key and its current
+/// cluster epoch/key so the peer can adopt a newer rotation.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Hello {
+    pub node: NodeInfo,
+    pub id_pub: [u8; 32],
+    pub eph_pub: [u8; 32],
+    pub epoch: u64,
+    pub cluster: [u8; 32],
+}
+
+/// Handshake reply, sealed with the root handshake key. `cluster`/`epoch` carry
+/// the peer's (possibly newer) cluster key so a late joiner syncs it.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct HelloAck {
+    pub node: NodeInfo,
+    pub id_pub: [u8; 32],
+    pub eph_pub: [u8; 32],
+    pub epoch: u64,
+    pub cluster: [u8; 32],
+}
+
+/// A cluster-key rotation, broadcast across the mesh (sealed with the pairwise
+/// session key). Receivers adopt it when `epoch` is newer and re-propagate.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct KeyRotate {
+    pub epoch: u64,
+    pub key: [u8; 32],
+}
+
 /// A request travelling across the mesh. `dest` is the ultimate node that must
 /// execute it (because only that node can reach the target / owns the egress).
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -193,10 +246,33 @@ pub struct StatusResponse {
     #[serde(default)]
     pub pinned_port: Option<u16>,
     pub ports: Vec<u16>,
+    /// Current cluster-key epoch (0 = never rotated).
+    #[serde(default)]
+    pub cluster_epoch: u64,
     pub uptime_secs: u64,
     pub nodes: Vec<NodeStatus>,
     pub routes: Vec<RouteEntry>,
     pub capabilities: Vec<Capability>,
     #[serde(default)]
     pub egress: Vec<EgressStatus>,
+    /// Hot-swappable kernel status.
+    #[serde(default)]
+    pub kernel: KernelStatus,
+}
+
+/// Status of the hot-swappable Lua/Luau kernel (for the dashboard).
+#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+pub struct KernelStatus {
+    pub loaded: bool,
+    #[serde(default)]
+    pub version: String,
+    #[serde(default)]
+    pub rev: u64,
+    #[serde(default)]
+    pub workers: usize,
+    #[serde(default)]
+    pub source: String,
+    /// Module paths in the installed kernel (e.g. `main.lua`, `lib/util.lua`).
+    #[serde(default)]
+    pub files: Vec<String>,
 }

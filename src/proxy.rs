@@ -143,6 +143,14 @@ async fn send_once(
 /// then automatically falls back to each live local egress proxy in turn (each
 /// attempt is itself a reachability probe of the upstream target).
 pub async fn execute(state: &AppState, req: &TunnelRequest) -> crate::protocol::TunnelResponse {
+    // The kernel runs on the *executing* node: transform the outbound request
+    // here, then the upstream response after it comes back.
+    let mut owned = req.clone();
+    if let Some(k) = state.kernel().await {
+        owned = k.on_request(owned).await;
+    }
+    let req = &owned;
+
     let mut plan: Vec<Option<String>> = Vec::new();
     match &req.egress {
         Some(name) => plan.push(Some(name.clone())),
@@ -161,6 +169,9 @@ pub async fn execute(state: &AppState, req: &TunnelRequest) -> crate::protocol::
                 if let Some(name) = egress {
                     r.headers
                         .push(("x-tiny-station-egress".into(), name.clone()));
+                }
+                if let Some(k) = state.kernel().await {
+                    r = k.on_response(r).await;
                 }
                 return r;
             }
@@ -185,4 +196,44 @@ fn error_response(
     let mut r = crate::protocol::TunnelResponse::error(status, msg);
     r.served_by = state.self_info.id.clone();
     r
+}
+
+/// A single outbound HTTP request for the kernel's `ctx.net.fetch` host API.
+/// Unlike `execute` there is no egress fallback: the caller (script) chooses.
+pub async fn kernel_fetch(
+    state: &AppState,
+    url: &str,
+    method: &str,
+    headers: &[(String, String)],
+    body: Vec<u8>,
+    timeout_ms: Option<u64>,
+    egress: Option<&str>,
+) -> Result<(u16, Vec<(String, String)>, Vec<u8>), String> {
+    let client = build_client(state, egress, timeout_ms).await?;
+    let method = Method::from_bytes(method.as_bytes()).unwrap_or(Method::GET);
+    let mut rb = client.request(method, url);
+    for (k, v) in headers {
+        if is_hop_by_hop(k) {
+            continue;
+        }
+        if let (Ok(name), Ok(val)) = (
+            HeaderName::from_bytes(k.as_bytes()),
+            HeaderValue::from_str(v),
+        ) {
+            rb = rb.header(name, val);
+        }
+    }
+    if !body.is_empty() {
+        rb = rb.body(body);
+    }
+    let resp = rb.send().await.map_err(|e| format!("请求失败: {}", e))?;
+    let status = resp.status().as_u16();
+    let hdrs: Vec<(String, String)> = resp
+        .headers()
+        .iter()
+        .filter(|(k, _)| !is_hop_by_hop(k.as_str()))
+        .filter_map(|(k, v)| v.to_str().ok().map(|s| (k.as_str().to_string(), s.to_string())))
+        .collect();
+    let bytes = resp.bytes().await.unwrap_or_default().to_vec();
+    Ok((status, hdrs, bytes))
 }
