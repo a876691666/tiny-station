@@ -1,9 +1,26 @@
 use crate::config::Config;
-use crate::protocol::{base_url, NodeInfo, ProxyInfo};
-use std::collections::HashMap;
+use crate::protocol::{base_url, NodeInfo, ProxyInfo, ReverseTask, TunnelResponse};
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use tokio::sync::RwLock;
+use tokio::sync::{mpsc, oneshot, Mutex, RwLock};
+
+/// How long a hub holds a leaf's reverse poll open before answering "no work".
+pub const REVERSE_POLL_SECS: u64 = 20;
+/// A reverse channel is considered dead if the leaf hasn't polled within this.
+pub const REVERSE_STALE_MS: u64 = 60_000;
+
+/// Hub-side handle for one NAT'd leaf's reverse channel.
+pub struct ReverseNode {
+    /// Delivers tasks to the leaf's currently open (or next) poll.
+    pub tx: mpsc::UnboundedSender<ReverseTask>,
+    /// The leaf's task receiver; only one poll may be waiting on it at a time.
+    pub rx: Mutex<mpsc::UnboundedReceiver<ReverseTask>>,
+    /// Last time the leaf polled (for liveness / reaping).
+    pub last_seen_ms: AtomicU64,
+}
 
 pub fn now_ms() -> u64 {
     SystemTime::now()
@@ -93,6 +110,12 @@ pub struct AppState {
     pub control: reqwest::Client,
     /// Client used to forward tunnel requests between nodes.
     pub tunnel: reqwest::Client,
+    /// Hub-side reverse channels: node id -> channel to a NAT'd leaf.
+    pub reverse: RwLock<HashMap<String, Arc<ReverseNode>>>,
+    /// Reverse calls awaiting a result, keyed by request id.
+    pub reverse_pending: RwLock<HashMap<String, oneshot::Sender<TunnelResponse>>>,
+    /// Leaves we've already spawned a reverse poll loop for.
+    pub reverse_loops: RwLock<HashSet<String>>,
 }
 
 impl AppState {
@@ -119,7 +142,50 @@ impl AppState {
             reach_cache: RwLock::new(HashMap::new()),
             control,
             tunnel,
+            reverse: RwLock::new(HashMap::new()),
+            reverse_pending: RwLock::new(HashMap::new()),
+            reverse_loops: RwLock::new(HashSet::new()),
         }
+    }
+
+    /// Get (creating if needed) the reverse-channel slot for a leaf node.
+    pub async fn reverse_slot(&self, id: &str) -> Arc<ReverseNode> {
+        if let Some(n) = self.reverse.read().await.get(id) {
+            return n.clone();
+        }
+        let mut map = self.reverse.write().await;
+        map.entry(id.to_string())
+            .or_insert_with(|| {
+                let (tx, rx) = mpsc::unbounded_channel();
+                Arc::new(ReverseNode {
+                    tx,
+                    rx: Mutex::new(rx),
+                    last_seen_ms: AtomicU64::new(0),
+                })
+            })
+            .clone()
+    }
+
+    pub async fn reverse_touch(&self, id: &str) {
+        if let Some(n) = self.reverse.read().await.get(id) {
+            n.last_seen_ms.store(now_ms(), Ordering::Relaxed);
+        }
+    }
+
+    /// True if a fresh reverse channel to `id` exists (so we can route via it).
+    pub async fn reverse_fresh(&self, id: &str) -> bool {
+        let now = now_ms();
+        self.reverse
+            .read()
+            .await
+            .get(id)
+            .map(|n| now.saturating_sub(n.last_seen_ms.load(Ordering::Relaxed)) <= REVERSE_STALE_MS)
+            .unwrap_or(false)
+    }
+
+    /// Drop a reverse channel (leaf went away).
+    pub async fn reverse_drop(&self, id: &str) {
+        self.reverse.write().await.remove(id);
     }
 
     pub async fn config(&self) -> Config {

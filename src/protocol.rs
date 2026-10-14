@@ -105,6 +105,39 @@ impl TunnelResponse {
     }
 }
 
+// ---------------- reverse channel (NAT traversal) ----------------
+
+/// A unit of work handed to a NAT'd node over its reverse channel. The node
+/// executes the enclosed tunnel request locally and returns the response on its
+/// next poll. Used when a hub cannot dial the node directly.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ReverseTask {
+    pub req_id: String,
+    pub request: TunnelRequest,
+}
+
+/// A leaf asking its hub for work: "here is the result of your previous task
+/// (if any) — do you have more for me?"
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ReversePoll {
+    pub node: NodeInfo,
+    #[serde(default)]
+    pub result: Option<ReverseResult>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ReverseResult {
+    pub req_id: String,
+    pub response: TunnelResponse,
+}
+
+/// The hub's reply: a task to execute, or `null` to keep the channel warm.
+#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+pub struct ReversePollResp {
+    #[serde(default)]
+    pub task: Option<ReverseTask>,
+}
+
 // ---------------- status / dashboard payloads ----------------
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

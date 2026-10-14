@@ -103,7 +103,12 @@ POST /proxy?target=https://example.com/upload&via=auto
 | POST | `/api/config` | 覆盖写入配置(立即生效,`ip`/`bind`/`ports` 需重启) |
 | GET | `/api/reach?host=&port=` | 探测本节点能否直达某目标,返回 `{reachable,egress}` |
 | POST | `/api/tunnel` | 节点间隧道协议(内部使用,接收 `TunnelRequest`) |
+| POST | `/api/reverse/poll` | 反向通道长轮询(NAT 节点 → 中心节点,内部使用) |
 | GET | `/` | 网页管理界面 |
+
+> **NAT 穿透**:位于 NAT 后、只能出站的节点会自动向配置的 `peers` 发起 `/api/reverse/poll` 长轮询。
+> 对端可经该通道向它下发请求,因此**单向配置即可双向访问**,且**绝不回拨**对方广播的 IP。
+> 详见 [README](README.md#位于-nat-后的节点反向通道)。
 
 ---
 

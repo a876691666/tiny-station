@@ -2,11 +2,12 @@ use crate::config::Config;
 use crate::dashboard;
 use crate::net;
 use crate::protocol::{
-    Capability, GossipBody, NodeInfo, NodeStatus, RouteEntry, StatusResponse, TunnelRequest,
-    TunnelResponse,
+    Capability, GossipBody, NodeInfo, NodeStatus, ReversePoll, ReversePollResp, RouteEntry,
+    StatusResponse, TunnelRequest, TunnelResponse,
 };
 use crate::route;
-use crate::state::{now_ms, AppState};
+use crate::state::{now_ms, AppState, REVERSE_POLL_SECS};
+use std::time::Duration;
 use axum::body::{Body, Bytes};
 use axum::extract::{DefaultBodyLimit, Query, State};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode};
@@ -30,6 +31,7 @@ pub fn router(state: Shared) -> Router {
         .route("/api/config", get(api_get_config).post(api_put_config))
         .route("/api/tunnel", post(api_tunnel))
         .route("/api/request", post(api_request))
+        .route("/api/reverse/poll", post(api_reverse_poll))
         .route("/api/reach", get(api_reach))
         .route("/proxy", any(proxy_handler))
         .layer(DefaultBodyLimit::max(256 * 1024 * 1024))
@@ -127,6 +129,42 @@ async fn api_tunnel(
         return challenge();
     }
     Json(route::route_request(&s, req).await).into_response()
+}
+
+/// `POST /api/reverse/poll` — a NAT'd node's long-poll to its hub.
+///
+/// The poll both **returns the result of the previous task** and **waits for the
+/// next one**, so a hub can reach a leaf it cannot dial. Authenticated with the
+/// hub's own mesh credential (which the leaf holds as a configured peer).
+async fn api_reverse_poll(
+    State(s): State<Shared>,
+    headers: HeaderMap,
+    Json(body): Json<ReversePoll>,
+) -> Response {
+    if !mesh_ok(&headers, &s).await {
+        return challenge();
+    }
+    let node = body.node;
+    if node.id == s.self_info.id {
+        return Json(ReversePollResp::default()).into_response();
+    }
+    // 1) Deliver the previous task's result to whoever is waiting.
+    if let Some(res) = body.result {
+        if let Some(tx) = s.reverse_pending.write().await.remove(&res.req_id) {
+            let _ = tx.send(res.response);
+        }
+    }
+    // 2) Register/liveness: this leaf is now reachable through the reverse link.
+    net::upsert_reverse_peer(&s, node.clone()).await;
+    let slot = s.reverse_slot(&node.id).await;
+    s.reverse_touch(&node.id).await;
+
+    // 3) Hand out the next task, waiting up to REVERSE_POLL_SECS for one.
+    let mut rx = slot.rx.lock().await;
+    match tokio::time::timeout(Duration::from_secs(REVERSE_POLL_SECS), rx.recv()).await {
+        Ok(Some(task)) => Json(ReversePollResp { task: Some(task) }).into_response(),
+        _ => Json(ReversePollResp::default()).into_response(),
+    }
 }
 
 // ------------------------- public data plane -------------------------

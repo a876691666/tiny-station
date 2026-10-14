@@ -133,6 +133,14 @@ pub async fn route_request(state: &AppState, mut tr: TunnelRequest) -> TunnelRes
     match net::next_hop(state, &tr.dest).await {
         Some(next) => {
             tr.hops.push(self_id.clone());
+            // A peer we cannot dial (a NAT'd node whose link is configured only
+            // in the other direction) is reachable *only* through its reverse
+            // channel. Never fall back to dialing its advertised IP.
+            if next.dial.is_none() {
+                let mut r = net::reverse_call(state, &next.info.id, tr).await;
+                r.path.insert(0, self_id);
+                return r;
+            }
             let url = format!("{}/api/tunnel", next.addr_url());
             let rb = state.tunnel.post(&url).json(&tr);
             let rb = match &next.auth {

@@ -1,6 +1,6 @@
 [package]
 name = "tiny-station"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "Logical mesh proxy network: any tiny-station node can relay requests through the whole mesh."
 

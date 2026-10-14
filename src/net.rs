@@ -1,7 +1,10 @@
 use crate::config::Target;
-use crate::protocol::{base_url, GossipBody, NodeInfo, PeerView};
+use crate::protocol::{
+    base_url, GossipBody, NodeInfo, PeerView, ReversePoll, ReversePollResp, ReverseResult,
+    ReverseTask, TunnelRequest, TunnelResponse,
+};
 use crate::route;
-use crate::state::{now_ms, AppState, PeerEntry};
+use crate::state::{now_ms, AppState, PeerEntry, REVERSE_POLL_SECS, REVERSE_STALE_MS};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -107,6 +110,11 @@ async fn upsert_direct(state: &AppState, info: NodeInfo, latency_ms: u64, auth: 
 }
 
 async fn mark_unreachable(state: &AppState, id: &str, reason: String) {
+    // A failed direct probe is expected for a NAT'd peer that only exposes a
+    // reverse channel; never demote it while that channel is still alive.
+    if state.reverse_fresh(id).await {
+        return;
+    }
     let mut peers = state.peers.write().await;
     if let Some(e) = peers.get_mut(id) {
         e.directly_reachable = false;
@@ -390,7 +398,7 @@ async fn gossip_round(state: &AppState) {
         .read()
         .await
         .values()
-        .filter(|e| e.directly_reachable)
+        .filter(|e| e.directly_reachable && e.dial.is_some())
         .map(|e| (e.addr_url(), e.auth.clone()))
         .collect();
     for (base, auth) in targets {
@@ -512,7 +520,7 @@ pub async fn discover_owner(
         .read()
         .await
         .iter()
-        .filter(|(_, e)| e.directly_reachable)
+        .filter(|(_, e)| e.directly_reachable && e.dial.is_some())
         .map(|(id, e)| (id.clone(), e.addr_url(), e.auth.clone()))
         .collect();
 
@@ -627,6 +635,168 @@ pub async fn next_hop(state: &AppState, dest: &str) -> Option<PeerEntry> {
     state.peers.read().await.get(hop).cloned()
 }
 
+// ------------------------- reverse channel (NAT traversal) -----------------
+
+/// Mark a node as reachable through a reverse channel (it polled us). We cannot
+/// dial it, but we can hand it work over the open channel.
+pub async fn upsert_reverse_peer(state: &AppState, info: NodeInfo) {
+    if info.id == state.self_info.id {
+        return;
+    }
+    let mut peers = state.peers.write().await;
+    let id = info.id.clone();
+    let entry = peers.entry(id).or_insert_with(|| PeerEntry {
+        info: info.clone(),
+        links: vec![],
+        proxies: vec![],
+        reachable: vec![],
+        internet: false,
+        auth: None,
+        dial: None,
+        configured: false,
+        directly_reachable: false,
+        latency_ms: None,
+        last_error: None,
+        last_seen_ms: now_ms(),
+    });
+    entry.info = info;
+    entry.directly_reachable = true;
+    entry.last_error = None;
+    entry.last_seen_ms = now_ms();
+}
+
+/// Deliver a tunnel request to a NAT'd node over its reverse channel and await
+/// the response. Returns an error response when no channel exists.
+pub async fn reverse_call(state: &AppState, node_id: &str, req: TunnelRequest) -> TunnelResponse {
+    // Only ever deliver over a live reverse channel — we must not dial the
+    // node's advertised IP as a substitute.
+    if !state.reverse_fresh(node_id).await {
+        return TunnelResponse::error(503, format!("no reverse channel to {}", node_id));
+    }
+    let slot = state.reverse.read().await.get(node_id).cloned();
+    let Some(slot) = slot else {
+        return TunnelResponse::error(503, format!("no reverse channel to {}", node_id));
+    };
+    let req_id = uuid::Uuid::new_v4().to_string();
+    let (otx, orx) = tokio::sync::oneshot::channel();
+    state
+        .reverse_pending
+        .write()
+        .await
+        .insert(req_id.clone(), otx);
+    if slot
+        .tx
+        .send(ReverseTask {
+            req_id: req_id.clone(),
+            request: req,
+        })
+        .is_err()
+    {
+        state.reverse_pending.write().await.remove(&req_id);
+        return TunnelResponse::error(503, format!("reverse channel to {} closed", node_id));
+    }
+    match tokio::time::timeout(Duration::from_secs(90), orx).await {
+        Ok(Ok(resp)) => resp,
+        Ok(Err(_)) => TunnelResponse::error(502, "reverse result dropped"),
+        Err(_) => {
+            state.reverse_pending.write().await.remove(&req_id);
+            TunnelResponse::error(504, format!("reverse call to {} timed out", node_id))
+        }
+    }
+}
+
+/// Long-poll loop run by a leaf toward each configured, directly-reachable peer
+/// so the peer (a hub) can send it work even when it is behind NAT.
+async fn reverse_poll_loop(state: Arc<AppState>, peer_id: String) {
+    let mut carry: Option<ReverseResult> = None;
+    loop {
+        let endpoint = {
+            let peers = state.peers.read().await;
+            match peers.get(&peer_id) {
+                Some(e) if e.directly_reachable => Some((e.addr_url(), e.auth.clone())),
+                _ => None,
+            }
+        };
+        let Some((base, auth)) = endpoint else {
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            continue;
+        };
+        let url = format!("{}/api/reverse/poll", base);
+        let poll = ReversePoll {
+            node: state.self_info.clone(),
+            result: carry.take(),
+        };
+        let rb = state
+            .tunnel
+            .post(&url)
+            .json(&poll)
+            .timeout(Duration::from_secs(REVERSE_POLL_SECS + 15));
+        match apply_auth(rb, &auth).send().await {
+            Ok(resp) => match resp.json::<ReversePollResp>().await {
+                Ok(body) => {
+                    if let Some(task) = body.task {
+                        let mut tr = task.request;
+                        if tr.dest.is_empty() {
+                            tr.dest = state.self_info.id.clone();
+                        }
+                        let response = route::route_request(&state, tr).await;
+                        carry = Some(ReverseResult {
+                            req_id: task.req_id,
+                            response,
+                        });
+                    }
+                }
+                Err(_) => tokio::time::sleep(Duration::from_secs(1)).await,
+            },
+            Err(_) => tokio::time::sleep(Duration::from_secs(1)).await,
+        }
+    }
+}
+
+/// Start a reverse poll loop for every configured, directly-reachable peer that
+/// doesn't have one yet.
+async fn ensure_reverse_loops(state: &Arc<AppState>) {
+    let ids: Vec<String> = state
+        .peers
+        .read()
+        .await
+        .values()
+        .filter(|e| e.configured && e.directly_reachable)
+        .map(|e| e.info.id.clone())
+        .collect();
+    for id in ids {
+        if state.reverse_loops.write().await.insert(id.clone()) {
+            tracing::debug!("为 {} 启动反向通道轮询", id);
+            tokio::spawn(reverse_poll_loop(state.clone(), id));
+        }
+    }
+}
+
+/// Drop reverse channels whose leaf stopped polling, and mark those peers down.
+async fn reap_reverse(state: &AppState) {
+    let now = now_ms();
+    let stale: Vec<String> = {
+        let map = state.reverse.read().await;
+        map.iter()
+            .filter(|(_, n)| {
+                now.saturating_sub(n.last_seen_ms.load(std::sync::atomic::Ordering::Relaxed))
+                    > REVERSE_STALE_MS
+            })
+            .map(|(k, _)| k.clone())
+            .collect()
+    };
+    for id in stale {
+        state.reverse_drop(&id).await;
+        let mut peers = state.peers.write().await;
+        if let Some(e) = peers.get_mut(&id) {
+            if !e.configured {
+                e.directly_reachable = false;
+                e.last_error = Some("反向通道已断开".to_string());
+            }
+        }
+    }
+}
+
 pub fn spawn(state: Arc<AppState>) {
     tokio::spawn(async move {
         loop {
@@ -634,8 +804,10 @@ pub fn spawn(state: Arc<AppState>) {
             services_round(&state).await;
             discover_targets(&state).await;
             health_round(&state).await;
+            ensure_reverse_loops(&state).await;
             gossip_round(&state).await;
             prune(&state).await;
+            reap_reverse(&state).await;
             let interval = Duration::from_secs(state.config().await.gossip_interval());
             tokio::time::sleep(interval).await;
         }
