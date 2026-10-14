@@ -4,24 +4,21 @@ import {
   NCard,
   NButton,
   NSpace,
-  NInput,
   NTag,
   NDescriptions,
   NDescriptionsItem,
   NDataTable,
-  NTabs,
-  NTabPane,
+  NUpload,
+  NText,
   useMessage,
   type DataTableColumns,
+  type UploadFileInfo,
 } from 'naive-ui'
 import { api, ApiError, type KernelInfoResponse } from '../api'
 
 const message = useMessage()
 const info = ref<KernelInfoResponse | null>(null)
-const code = ref('')
-const spec = ref(
-  '{\n  "entry": "main.lua",\n  "files": {\n    "main.lua": "local M={} M.abi=1 M.version=\\"v1\\"\\nreturn M\\n",\n    "lib/util.lua": "return {}\\n"\n  }\n}',
-)
+const picked = ref<File | null>(null)
 const busy = ref(false)
 
 const errText = (e: unknown) => (e instanceof ApiError ? `${e.status} ${e.body}` : String(e))
@@ -34,6 +31,10 @@ async function loadInfo() {
   }
 }
 onMounted(loadInfo)
+
+function onPick({ fileList }: { fileList: UploadFileInfo[] }) {
+  picked.value = fileList[0]?.file ?? null
+}
 
 async function run(fn: () => Promise<unknown>, ok: string) {
   busy.value = true
@@ -48,31 +49,21 @@ async function run(fn: () => Promise<unknown>, ok: string) {
   }
 }
 
-const apply = (bc: boolean) =>
-  run(() => api.kernelPut(code.value, bc), bc ? '已推送全网' : '已本机升级')
-
-function applyJson(bc: boolean) {
-  let parsed: { entry?: string; files: Record<string, string> }
-  try {
-    parsed = JSON.parse(spec.value)
-  } catch {
-    message.error('JSON 解析失败')
+const apply = (broadcast: boolean) => {
+  if (!picked.value) {
+    message.warning('请先选择内核包(.zip)')
     return
   }
-  run(() => api.kernelPutJson(parsed, bc), bc ? '已推送全网' : '已本机升级')
+  const file = picked.value
+  run(
+    () => api.kernelPutPackage(file, broadcast),
+    broadcast ? '已推送全网' : '已本机升级',
+  )
 }
 
-async function loadSource() {
-  try {
-    code.value = await api.kernelSource()
-  } catch {
-    message.warning('尚无内核')
-  }
-}
-
-const unload = () => run(() => api.kernelDelete(), '已卸载')
 const reload = () => run(() => api.kernelReload(), '已重载')
 const rollback = () => run(() => api.kernelRollback(), '已回滚')
+const unload = () => run(() => api.kernelDelete(), '已卸载')
 
 const metricCols: DataTableColumns<{ name: string; value: number }> = [
   { title: '指标', key: 'name' },
@@ -99,36 +90,25 @@ const metricData = computed(() =>
     </n-descriptions>
   </n-card>
 
-  <n-card title="上传 / 热升级(免重启)">
-    <n-tabs type="line" animated>
-      <n-tab-pane name="single" tab="入口脚本">
-        <n-space vertical>
-          <div class="sub">粘贴入口脚本(main.lua),点「仅本机升级」热替换当前节点;「全网升级」推送到所有节点。</div>
-          <n-input v-model:value="code" type="textarea" :rows="14" placeholder="粘贴 Luau 入口脚本(参考 examples/kernel/)" />
-          <n-space>
-            <n-button type="primary" :loading="busy" @click="apply(false)">仅本机升级</n-button>
-            <n-button type="warning" :loading="busy" @click="apply(true)">全网升级</n-button>
-            <n-button quaternary @click="loadSource">载入当前脚本</n-button>
-          </n-space>
-        </n-space>
-      </n-tab-pane>
-
-      <n-tab-pane name="multi" tab="多文件(JSON)">
-        <n-space vertical>
-          <div class="sub">整包替换模块集合:<code>{ entry, files: { "main.lua": "...", "lib/a.lua": "..." } }</code></div>
-          <n-input v-model:value="spec" type="textarea" :rows="12" />
-          <n-space>
-            <n-button type="primary" :loading="busy" @click="applyJson(false)">仅本机升级</n-button>
-            <n-button type="warning" :loading="busy" @click="applyJson(true)">全网升级</n-button>
-          </n-space>
-        </n-space>
-      </n-tab-pane>
-    </n-tabs>
-
-    <n-space style="margin-top: 16px">
-      <n-button :loading="busy" @click="reload">从磁盘重载</n-button>
-      <n-button :loading="busy" @click="rollback">回滚上一版</n-button>
-      <n-button type="error" :loading="busy" @click="unload">卸载内核</n-button>
+  <n-card title="上传内核包(热升级,免重启)">
+    <n-space vertical>
+      <n-text depth="3" style="font-size: 12px">
+        选择一个内核包(.zip,内含 main.lua 及可选 require 模块)。「仅本机升级」只更新当前节点;
+        「全网升级」把该版本推送到所有节点并立即生效。
+      </n-text>
+      <n-upload :default-upload="false" :max="1" accept=".zip" @change="onPick">
+        <n-button>选择内核包 (.zip)</n-button>
+      </n-upload>
+      <n-text v-if="picked" depth="3" style="font-size: 12px">已选择:{{ picked.name }}</n-text>
+      <n-space>
+        <n-button type="primary" :loading="busy" @click="apply(false)">仅本机升级</n-button>
+        <n-button type="warning" :loading="busy" @click="apply(true)">全网升级</n-button>
+      </n-space>
+      <n-space>
+        <n-button :loading="busy" @click="reload">从磁盘重载</n-button>
+        <n-button :loading="busy" @click="rollback">回滚上一版</n-button>
+        <n-button type="error" :loading="busy" @click="unload">卸载内核</n-button>
+      </n-space>
     </n-space>
   </n-card>
 
@@ -136,11 +116,3 @@ const metricData = computed(() =>
     <n-data-table :columns="metricCols" :data="metricData" :bordered="false" size="small" />
   </n-card>
 </template>
-
-<style scoped>
-.sub {
-  color: #8b95a3;
-  font-size: 12px;
-  margin-bottom: 8px;
-}
-</style>

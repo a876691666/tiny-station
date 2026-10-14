@@ -123,6 +123,14 @@ jobs:
           path: dist
           merge-multiple: true
 
+      - uses: actions/checkout@v4
+
+      - name: Build kernel package
+        run: |
+          set -euo pipefail
+          ( cd examples/kernel && zip -qr "${GITHUB_WORKSPACE}/dist/tiny-station-kernel-${{ github.ref_name }}.zip" . )
+          ls -l dist
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:

@@ -318,24 +318,20 @@ docker run -d --name tiny-station \
   指向 `.lua` 文件时按单文件内核处理。
 - 见 `examples/kernel/`(多模块示例)。
 
-### 一键热升级(推荐)
+### 上传内核包热升级(推荐)
 
-打开网页管理界面 → 「内核 · 热升级」→ 粘贴入口脚本 → 点「仅本机升级」或「全网升级」。
-**上传即刻生效,无需重启、无需密钥。**
+**内核包** = 一个 `.zip`,内含 `main.lua` 及可选 `require` 模块(打包时不带顶层目录,或以
+顶层目录打包也可,服务端会自动剥离)。
+
+打开网页管理界面 → 「内核 → 上传内核包」→ 选择 `.zip` → 点「仅本机升级」或「全网升级」。
+**上传即刻生效,无需重启、无需密钥。**(发布时 CI 会把 `examples/kernel/` 打成
+`tiny-station-kernel-<tag>.zip` 一并附在 Release 里。)
 
 ```bash
-# 单文件:粘贴/上传 main.lua 内容(保留其它模块)
-curl -u admin:123456 -X POST --data-binary @examples/kernel/main.lua \
-     "http://127.0.0.1:45910/api/kernel?broadcast=false"
-
-# 多文件:POST JSON 模块表(?broadcast=true 推送到全网)
-curl -u admin:123456 -H 'content-type: application/json' --data-binary '{
-  "entry": "main.lua",
-  "files": {
-    "main.lua": "local u=require(\"lib.util\")\n...",
-    "lib/util.lua": "return { greet=function(n) return \"hi \"..n end }"
-  }
-}' "http://127.0.0.1:45910/api/kernel?broadcast=true"
+# 打包 + 上传(纯文本 main.lua / JSON 模块表同样被接受)
+(cd examples/kernel && zip -qr /tmp/kernel.zip .)
+curl -u admin:123456 -H 'content-type: application/zip' --data-binary @/tmp/kernel.zip \
+     "http://127.0.0.1:45910/api/kernel?broadcast=false"   # 全网升级用 ?broadcast=true
 
 # 查看状态(含模块列表)/ 载入入口模块 / 从磁盘重载 / 回滚 / 卸载
 curl -u admin:123456 http://127.0.0.1:45910/api/kernel

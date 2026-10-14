@@ -606,15 +606,17 @@ struct MultiFileSpec {
     files: std::collections::BTreeMap<String, String>,
 }
 
-/// `POST /api/kernel` — upload a kernel (hot-swapped in, no restart).
+/// `POST /api/kernel` — install a kernel (hot-swapped in, no restart).
 ///
-/// * `application/json` (or a body starting with `{`) → `{ entry?, version?,
-///   files: { "main.lua": "...", "lib/a.lua": "..." } }` replaces the whole
-///   module set.
-/// * any other body → treated as the `main.lua` module, keeping other modules.
+/// Body is auto-detected:
+/// * a **kernel package** (`.zip`, magic `PK\x03\x04`, or `content-type` zip) →
+///   the whole module set replaces the current one;
+/// * `application/json` (or a body starting with `{`) →
+///   `{ entry?, files: { "main.lua": "...", "lib/a.lua": "..." } }`;
+/// * anything else → treated as the `main.lua` module (keeps other modules).
 ///
 /// `?broadcast=true` also pushes the new version to every node in the mesh.
-/// This is the one-click path used by the web UI.
+/// This is the upload path used by the web UI.
 async fn api_kernel_put(
     State(s): State<Shared>,
     headers: HeaderMap,
@@ -625,32 +627,48 @@ async fn api_kernel_put(
         return challenge();
     }
     let broadcast = q.get("broadcast").map(|v| v != "false").unwrap_or(false);
-    let text = match String::from_utf8(body.to_vec()) {
-        Ok(c) => c,
-        Err(_) => return plain(StatusCode::BAD_REQUEST, "内核必须是 UTF-8 文本"),
-    };
+    let bytes = body.to_vec();
     let ctype = headers
         .get("content-type")
         .and_then(|v| v.to_str().ok())
         .unwrap_or("")
         .to_ascii_lowercase();
-    let set = if ctype.contains("application/json") || text.trim_start().starts_with('{') {
-        match serde_json::from_str::<MultiFileSpec>(&text) {
-            Ok(spec) => crate::kernel::ModuleSet {
-                entry: spec.entry.unwrap_or_else(crate::kernel::default_entry),
-                files: spec.files,
-            },
-            Err(e) => return plain(StatusCode::BAD_REQUEST, &format!("解析多文件内核失败: {}", e)),
+
+    let set = if ctype.contains("zip") || bytes.starts_with(b"PK\x03\x04") {
+        match crate::kernel::package::from_zip(&bytes) {
+            Ok(set) => set,
+            Err(e) => return plain(StatusCode::BAD_REQUEST, &format!("内核包解析失败: {}", e)),
         }
     } else {
-        // Plain body: update the entry module, keep any existing modules.
-        let mut set = s
-            .kernel_module_set()
-            .await
-            .unwrap_or_else(|| crate::kernel::ModuleSet::single(""));
-        set.entry = crate::kernel::default_entry();
-        set.files.insert(set.entry.clone(), text);
-        set
+        let text = match String::from_utf8(bytes) {
+            Ok(c) => c,
+            Err(_) => {
+                return plain(
+                    StatusCode::BAD_REQUEST,
+                    "内核必须是 UTF-8 文本、JSON 或内核包(.zip)",
+                )
+            }
+        };
+        if ctype.contains("application/json") || text.trim_start().starts_with('{') {
+            match serde_json::from_str::<MultiFileSpec>(&text) {
+                Ok(spec) => crate::kernel::ModuleSet {
+                    entry: spec.entry.unwrap_or_else(crate::kernel::default_entry),
+                    files: spec.files,
+                },
+                Err(e) => {
+                    return plain(StatusCode::BAD_REQUEST, &format!("解析多文件内核失败: {}", e))
+                }
+            }
+        } else {
+            // Plain body: update the entry module, keep any existing modules.
+            let mut set = s
+                .kernel_module_set()
+                .await
+                .unwrap_or_else(|| crate::kernel::ModuleSet::single(""));
+            set.entry = crate::kernel::default_entry();
+            set.files.insert(set.entry.clone(), text);
+            set
+        }
     };
     match install_and_broadcast(&s, &set, broadcast).await {
         Ok((rev, version)) => Json(serde_json::json!({

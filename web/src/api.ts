@@ -171,6 +171,13 @@ export const api = {
       method: 'POST',
       ...json(spec),
     }),
+  async kernelPutPackage(file: File, broadcast: boolean) {
+    const buf = await file.arrayBuffer()
+    return call<{ ok: boolean; version?: string; modules?: number }>(
+      `/api/kernel?broadcast=${broadcast}`,
+      { method: 'POST', headers: { 'content-type': 'application/zip' }, body: buf },
+    )
+  },
   kernelReload: () => call<{ ok: boolean }>('/api/kernel/reload', { method: 'POST' }),
   kernelRollback: () => call<{ ok: boolean }>('/api/kernel/rollback', { method: 'POST' }),
   kernelDelete: () => call<{ ok: boolean }>('/api/kernel', { method: 'DELETE' }),

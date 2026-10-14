@@ -43,6 +43,7 @@ pub mod bundle;
 pub mod disk;
 mod host;
 pub mod metrics;
+pub mod package;
 mod runtime;
 pub mod store;
 mod timers;

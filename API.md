@@ -112,7 +112,7 @@ POST /proxy?target=https://example.com/upload&via=auto
 | POST | `/api/config` | 覆盖写入配置(立即生效,`ip`/`bind`/`ports` 需重启) |
 | POST | `/api/rotate` | **管理接口**:设置新 cluster key `{"mesh_key":"新值"}`(省略则随机)并广播全网 |
 | GET | `/api/kernel` | **管理接口**:查看当前内核状态(`{loaded,abi,version,workers,source,rev,metrics,files}`) |
-| POST | `/api/kernel` | **管理接口**:上传内核。纯文本 = `main.lua`(保留其它模块);JSON `{entry,files:{...}}` = 整包替换。编译后热替换并落盘;`?broadcast=true` 推送全网 |
+| POST | `/api/kernel` | **管理接口**:上传内核。**内核包(`.zip`)** = 整包替换;JSON `{entry,files}` = 整包替换;纯文本 = `main.lua`(保留其它模块)。编译后热替换并落盘;`?broadcast=true` 推送全网 |
 | GET | `/api/kernel/source` | **管理接口**:返回入口模块(`main.lua`)原文(供管理界面编辑器) |
 | POST | `/api/kernel/reload` | **管理接口**:从磁盘上的内核文件重新加载 |
 | POST | `/api/kernel/rollback` | **管理接口**:回滚到上一版内核(防回滚基线保留) |
